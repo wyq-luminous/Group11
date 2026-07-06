@@ -111,7 +111,10 @@ function getMemoryInfo() {
  * 获取磁盘使用情况（根分区 / 和 /home 分区）
  *
  * 通过 df -h 命令获取人类可读的磁盘信息，
- * 解析其输出为结构化数据。
+ * 解析其输出为结构化数据，并按文件系统去重。
+ *
+ * 例如：如果 / 和 /home 在同一分区上，
+ * 则只显示根分区，避免两张卡片显示相同数据。
  *
  * df -h 输出示例:
  * Filesystem      Size  Used Avail Use% Mounted on
@@ -123,10 +126,17 @@ function getDisksInfo() {
     const output = execSync('df -h / /home', { encoding: 'utf8' });
     const lines = output.trim().split('\n');
 
-    // 跳过第一行（标题），解析后续的数据行
+    const seen = new Set(); // 用于按文件系统去重
+
     return lines.slice(1).map((line) => {
       const parts = line.trim().split(/\s+/);
       if (parts.length < 6) return null;
+
+      const filesystem = parts[0]; // e.g. /dev/mmcblk0p2
+
+      // 同一文件系统只保留第一个（/ 优先于 /home）
+      if (seen.has(filesystem)) return null;
+      seen.add(filesystem);
 
       return {
         mount: parts[5],
