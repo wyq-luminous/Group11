@@ -383,11 +383,27 @@ app.get('/', (req, res) => {
 // 局域网内其他设备将无法访问。
 // 0.0.0.0 表示"监听本机所有网络接口"，包括 WiFi 和以太网。
 // ============================================================
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('============================================');
   console.log('  UNO-Q Status Web 已启动');
   console.log(`  本地访问:     http://localhost:${PORT}`);
   console.log(`  局域网访问:   http://${os.hostname()}.local:${PORT}`);
   console.log(`  IP 访问:      http://<board-ip>:${PORT}`);
   console.log('============================================');
+});
+
+// 优雅处理端口占用等启动错误
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error('============================================');
+    console.error('  ⚠️  端口已被占用！');
+    console.error(`  端口 ${PORT} 上已有其他程序在运行。`);
+    console.error(`  请先关闭占用端口的进程:`);
+    console.error(`    fuser -k ${PORT}/tcp`);
+    console.error(`  然后重新运行: npm start`);
+    console.error('============================================');
+  } else {
+    console.error('启动失败:', err.message);
+  }
+  process.exit(1);
 });
