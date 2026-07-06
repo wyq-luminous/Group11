@@ -20,6 +20,29 @@ const PORT = 3000;
 
 const { execSync } = require('child_process');
 
+/**
+ * 获取本机局域网 IPv4 地址
+ *
+ * 遍历所有网络接口，跳过：
+ *   - 内部回环接口 (lo)
+ *   - Docker 虚拟网桥 (docker*)
+ * 返回找到的第一个非内部 IPv4 地址
+ */
+function getLanIP() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    // 跳过回环和 Docker 虚拟接口
+    if (name === 'lo' || name.startsWith('docker')) continue;
+    for (const iface of interfaces[name]) {
+      // 只取 IPv4，跳过内部地址 (127.x.x.x)
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return '无法获取'; // fallback
+}
+
 // ============================================================
 // 数据采集函数
 // ============================================================
@@ -384,11 +407,12 @@ app.get('/', (req, res) => {
 // 0.0.0.0 表示"监听本机所有网络接口"，包括 WiFi 和以太网。
 // ============================================================
 const server = app.listen(PORT, '0.0.0.0', () => {
+  const ip = getLanIP();
   console.log('============================================');
   console.log('  UNO-Q Status Web 已启动');
   console.log(`  本地访问:     http://localhost:${PORT}`);
-  console.log(`  局域网访问:   http://${os.hostname()}.local:${PORT}`);
-  console.log(`  IP 访问:      http://<board-ip>:${PORT}`);
+  console.log(`  局域网访问:   http://${ip}:${PORT}`);
+  console.log(`  主机名访问:   http://${os.hostname()}.local:${PORT}`);
   console.log('============================================');
 });
 
