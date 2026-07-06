@@ -1,0 +1,13 @@
+{
+  "name": "unoq-status-web",
+  "version": "1.0.0",
+  "description": "UNO-Q system status dashboard — lightweight web app for AI Vibe Coding Workshop",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "license": "MIT"
+}
