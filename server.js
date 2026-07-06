@@ -108,38 +108,28 @@ function getMemoryInfo() {
 }
 
 /**
- * 获取磁盘使用情况（根分区 / 和 /home 分区）
+ * 获取磁盘使用情况（系统盘 / 和用户 Home 目录）
  *
- * 通过 df -h 命令获取人类可读的磁盘信息，
- * 解析其输出为结构化数据，并按文件系统去重。
- *
- * 例如：如果 / 和 /home 在同一分区上，
- * 则只显示根分区，避免两张卡片显示相同数据。
- *
- * df -h 输出示例:
- * Filesystem      Size  Used Avail Use% Mounted on
- * /dev/mmcblk0p2  7.8G  1.2G  6.6G  15% /
- * /dev/mmcblk0p3   15G  3.4G   12G  23% /home
+ * 分别查询两个路径，即使在同一分区也会独立显示。
+ * Home 路径使用 os.homedir() 动态获取，适配不同用户名。
  */
 function getDisksInfo() {
+  const paths = [
+    { label: '/', path: '/' },
+    { label: 'Home', path: os.homedir() },
+  ];
+
   try {
-    const output = execSync('df -h / /home', { encoding: 'utf8' });
-    const lines = output.trim().split('\n');
+    return paths.map(({ label, path }) => {
+      const output = execSync(`df -h '${path}'`, { encoding: 'utf8' });
+      const lines = output.trim().split('\n');
+      if (lines.length < 2) return null;
 
-    const seen = new Set(); // 用于按文件系统去重
-
-    return lines.slice(1).map((line) => {
-      const parts = line.trim().split(/\s+/);
+      const parts = lines[1].trim().split(/\s+/);
       if (parts.length < 6) return null;
 
-      const filesystem = parts[0]; // e.g. /dev/mmcblk0p2
-
-      // 同一文件系统只保留第一个（/ 优先于 /home）
-      if (seen.has(filesystem)) return null;
-      seen.add(filesystem);
-
       return {
-        mount: parts[5],
+        mount: label,
         total: parts[1],
         used: parts[2],
         percent: parseInt(parts[4], 10),
