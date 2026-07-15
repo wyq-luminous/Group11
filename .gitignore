@@ -1,0 +1,20 @@
+# ignore app cache folder
+.cache/
+
+# Python venv
+.venv/
+
+# Alert queue (runtime data, not code)
+alerts.jsonl
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db
+build/
+alerts.jsonl
+alerts.jsonl.delivered
+.venv/

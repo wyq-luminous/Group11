@@ -1,0 +1,33 @@
+# thresholds.yaml — Anomaly detection thresholds for UNO-Q monitor
+#
+# All thresholds are in percent (0-100).
+# The monitor script samples periodically and triggers alerts when
+# values exceed these thresholds for longer than `debounce_cycles`.
+
+monitor:
+  # Sampling interval in seconds
+  interval_sec: 30
+
+  # Debounce: how many consecutive over-threshold samples before alerting
+  debounce_cycles: 3
+
+  # Cooldown: minimum seconds between repeated alerts for the same metric
+  cooldown_sec: 600  # 10 minutes
+
+  # Alert queue file (relative to project root)
+  alert_file: "alerts.jsonl"
+
+  # CPU threshold (percent)
+  cpu:
+    warn: 70     # yellow / warning pattern on matrix
+    critical: 90 # red  / alert pushed to user
+
+  # Memory threshold (percent)
+  memory:
+    warn: 70
+    critical: 90
+
+  # Disk threshold (percent of /)
+  disk:
+    warn: 75
+    critical: 90

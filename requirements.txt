@@ -1,0 +1,5 @@
+# UNO-Q Remote Control System - Python dependencies
+# Keep minimal: msgpack for RPC, PyYAML for config
+
+msgpack>=1.0.0
+PyYAML>=6.0
