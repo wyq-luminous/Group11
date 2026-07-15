@@ -1,0 +1,25 @@
+# SmartPosture Guardian - 核心依赖 (UNO-Q ARM64 优化版)
+
+# --- 图像获取与空间域基础运算 ---
+# 必须使用 headless 版本，零 PC 依赖，防止 GUI 报错
+opencv-python-headless>=4.8.0
+# 用于空间域数组扁平化与欧氏距离计算，严禁使用频域操作
+numpy>=1.24.0
+pillow>=10.0.0
+
+# --- AI 姿态推理后端 ---
+# 解决 ARM64 + Python 3.13 兼容性问题，运行 MoveNet Lightning
+onnxruntime>=1.15.0
+
+# --- Hermes 云端告警扩展 ---
+# 用于触发家长微信异步推送
+requests>=2.31.0
+
+# --- 硬件 GPIO 控制 ---
+# 控制本地声光报警（蜂鸣器间歇鸣叫/LED变红）
+gpiod  # 或使用 python-periphery，根据系统实际情况
+
+# --- 前后端本地通信 API ---
+# 接收前端传输的专属用户基准值 (user_D_normal, user_Y_normal)
+fastapi>=0.100.0
+uvicorn>=0.22.0
