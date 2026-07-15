@@ -336,3 +336,20 @@ LED 点阵恢复显示。Git 初始化完成，与队友共用同一个 Group11 
 
 **Agent 回复摘要**:
 7 步全部完成，系统正常运行。判定管线从"双指标 OR"升级为"三层质量门控 + 三指标 OR"。用户需在浏览器 `/viewer` 观察 16 个绿色眼轮廓点是否跟随歪头旋转，并逐一测试前倾/低头/歪头/侧脸四个场景。
+
+---
+
+## 第11轮 — Phase 3 Bug 修复 (2026-07-15)
+
+**问题**:
+1. 报警状态下遮挡镜头无法触发重校准（`_handle_no_face` 仅在 MONITORING 状态设 `pending_recal`）
+2. 报警一直不解除（质量门控在 ALERTING 状态也拦截，恢复计时器无法推进）
+3. 调试视图显示 raw Y 坐标，低头时数值增大但用户困惑"越高越小"
+
+**修复**:
+- `_handle_no_face`: 除 CALIBRATING 外所有状态均可触发 `pending_recal`
+- 无人脸时 `return False`（停止报警），替代原来的 `return self.state.is_alerting`
+- 调试视图 README 中说明图像坐标系（Y=0 在顶部）
+
+**Agent 回复摘要**:
+提交 `b921205`，推送至 GitHub。用户确认遮挡重校准正常。

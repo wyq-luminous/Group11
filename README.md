@@ -11,8 +11,10 @@ SmartPosture_Guardian 是一款完全运行在 ARM64 边缘设备（Arduino UNO-
 **核心特点**：
 - 🚫 不依赖 PC，不连接云端，完全本地推理
 - ⚡ 空间域算法优化，无频域处理，极致省算力
-- 🔇 无感自动校准 + **遮挡镜头 2 秒触发重校准**，无需用户手动标定
-- 🌐 内置 Web 调试上位机，浏览器实时查看眼距标注
+- 🔇 无感自动校准 + **遮挡镜头 2 秒触发重校准**（任意状态可用），无需用户手动标定
+- 🎯 PFLD 98 点面部关键点精确定位双眼，支持歪头/侧脸抗干扰
+- 🧭 三指标复合判定（前倾 / 低头 / 歪头）+ 侧脸质量门控
+- 🌐 内置 Web 调试上位机，浏览器实时查看 16 点眼轮廓标注
 - 🔵 三色 LED 状态反馈 (绿=正常 / 红=报警 / 蓝=校准中)
 
 ---
@@ -27,12 +29,20 @@ SmartPosture_Guardian 是一款完全运行在 ARM64 边缘设备（Arduino UNO-
 
 **运行时重校准**: 用手掌完全遮挡摄像头 **2 秒以上**，移开后系统自动重新校准。适用于用户更换座位、调整摄像头位置等场景。校准期间板载 LED 显示蓝灯。
 
-### 2. 双指标复合判定
+### 2. 三指标复合判定
+
+系统通过 YuNet 检测人脸边界框，再由 PFLD ONNX (98 点 WFLW) 精确定位双眼及鼻尖，计算三项坐姿指标：
 
 | 指标 | 计算方法 | 报警阈值 |
 |------|----------|----------|
-| 眼距比率 | 当前眼距 / 基准眼距 | > 1.2×（头部前倾导致眼距放大） |
-| 高度偏移 | 基准 Y − 当前 Y | > 25px（低头导致眼睛下移） |
+| 前倾 | 当前眼距 / 基准眼距 | > 1.2×（头部靠近屏幕导致眼距放大） |
+| 低头 | 当前眼Y − 基准眼Y | > 25px（低头导致眼睛在画面中下移） |
+| 歪头 | atan2(右眼Y−左眼Y, 右眼X−左眼X) | > 15°（头部侧倾） |
+
+**质量门控**:
+- 侧脸 (鼻尖偏移比 > 0.35) → 丢弃帧，冻结计时器
+- 帧间眼距跳变 > 30% → 丢弃帧，冻结计时器
+- 双眼间距 < 15px → 判定为检测异常
 
 ### 3. 时间滤波防误报
 
@@ -60,7 +70,7 @@ SmartPosture_Guardian 是一款完全运行在 ARM64 边缘设备（Arduino UNO-
 │         └─ /api/v1/health       GET  健康检查        │
 │                                                      │
 │  线程2: 采集 (V4L2 30fps drain)                     │
-│  线程3: 推理 (YuNet ONNX → 眼距/高度)               │
+│  线程3: 推理 (YuNet 找脸 → PFLD 98点定位 → 姿态指标) │
 │  线程4: 主控 (PostureAnalyzer 状态机 + Alerter)     │
 │              │                                       │
 │              ▼ msgpack RPC                           │
@@ -149,13 +159,15 @@ SmartPosture_Guardian/
 ├── README.md              # 项目说明（本文件）
 ├── requirements.txt       # Python 依赖清单
 ├── src/
-│   ├── main.py            # 主入口 (四线程调度 + FastAPI)
+│   ├── main.py            # 主入口 (四线程调度 + FastAPI + FSM)
 │   ├── config.py          # 全局配置常量
 │   ├── alerter.py         # 报警输出 (LED矩阵 + RGB LED + 蜂鸣器)
-│   ├── debug_viewer.py    # 调试上位机 (MJPEG流 + 画面标注)
-│   └── convert_tflite_to_onnx.py  # TFLite→ONNX 转换工具
+│   ├── landmarker.py      # PFLD 98点关键点定位 (双眼+鼻尖)
+│   ├── debug_viewer.py    # 调试上位机 (MJPEG流 + 16点眼轮廓标注)
+│   └── bench_pfld.py      # PFLD 模型 benchmark 工具
 ├── models/
-│   └── face_detection_yunet.onnx   # YuNet DNN 人脸检测 (228KB)
+│   ├── face_detection_yunet.onnx   # YuNet DNN 人脸检测 (228KB)
+│   └── pfpld.onnx                  # PFLD 98点面部关键点 (6.6MB)
 ├── docs/
 │   └── DevLog.md          # 开发记录
 ├── tests/                 # 测试
@@ -200,7 +212,8 @@ python3 src/main.py
 | 组件 | 选型 | 理由 |
 |------|------|------|
 | 图像采集 | OpenCV headless + V4L2 (MJPG) | 无桌面环境，MJPG 压缩节省 USB 带宽 |
-| AI 推理 | OpenCV FaceDetectorYN (YuNet ONNX) | 228KB 极小模型，直接输出眼睛关键点 |
+| 人脸检测 | OpenCV FaceDetectorYN (YuNet ONNX) | 228KB 极小人脸检测 |
+| 关键点定位 | PFLD ONNX (98 点 WFLW) | 6.6MB，双眼各 8 轮廓点 + 鼻尖，OpenCV DNN 推理 |
 | 矩阵运算 | NumPy | 空间域向量化计算 |
 | LED 矩阵 | STM32 Charlieplexing → Bridge RPC | 硬件由 MCU 管理，Linux 端不可直接访问 |
 | 蜂鸣器 | STM32 digitalWrite(D2) → Bridge RPC | LOW 电平触发，通过 MCU sketch 控制 |
@@ -217,15 +230,16 @@ python3 src/main.py
 - [x] **Git 版本管理**: 接入 GitHub `wyq-luminous/Group11.git`，DevLog 自动记录 (2026-07-15)
 - [ ] **LED 阵列灰度动画**: 利用 8 级硬件灰度实现报警图案呼吸效果
 - [ ] **云端告警推送**: `requests` → Hermes 服务触发家长微信通知 (10min 冷却)
-- [ ] **异常场景抗干扰**: 无人状态检测 + 转头/侧头过滤
+- [x] **异常场景抗干扰**: 侧脸丢弃 + 帧间跳变冻结 + 歪头检测 (2026-07-15)
+- [x] **PFLD 面部关键点**: 98 点 WFLW 替代 YuNet 5 粗点，精确追踪双眼 (2026-07-15)
 - [ ] **前端校准对接**: 陈朵的 Web 前端通过 `POST /api/v1/calibration` 注入用户专属基准值
 - [ ] **日志持久化**: 坐姿异常事件记录到 `logs/events.jsonl`
 - [ ] **单元测试**: `tests/` 下补充状态机逻辑和眼距计算的测试用例
 
 ### 中期 (模型升级)
 
-- [ ] **face_landmark ONNX**: 当网络条件改善后，使用 468 关键点模型替代 YuNet 5 点，提升眼睛定位精度
-- [ ] **模型量化**: INT8 量化加速推理（目标 < 50ms/帧）
+- [x] **PFLD 面部关键点**: 98 点 WFLW 替代 YuNet 5 点，精确追踪双眼 (2026-07-15)
+- [ ] **模型量化**: INT8 量化加速 PFLD 推理（目标 < 30ms/帧）
 - [ ] **多人脸处理**: 支持画面中多人时选择主要使用者
 
 ### 长期 (产品化)
