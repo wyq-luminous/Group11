@@ -770,18 +770,20 @@ class PostureAnalyzer:
     def _handle_no_face(self, now: float) -> bool:
         """
         无脸帧处理：追踪遮挡时长以触发重校准。
-        仅在 MONITORING 状态下检测遮挡（校准/报警期间不触发）。
+        MONITORING / ALERTING / COOLDOWN 状态下均可触发。
         """
         self.state.mark_no_face(now)
         duration = self.state.get_no_face_duration(now)
 
-        if self.posture == PostureState.MONITORING:
+        # 遮挡 ≥2s → 标记待重校准 (CALIBRATING 期间除外，免干扰正在进行的校准)
+        if self.posture != PostureState.CALIBRATING:
             if duration >= CALIBRATION_COVER_SEC and not self.state.pending_recal:
                 self.state.pending_recal = True
                 logger.info(f"🔁 检测到遮挡 {duration:.1f}s ≥ {CALIBRATION_COVER_SEC}s，"
                             f"人脸恢复后将重新校准")
 
-        return self.state.is_alerting
+        # 无人脸时不报警
+        return False
 
     def _start_recalibration(self, now: float):
         """人脸恢复后，重置校准数据并切入 CALIBRATING 状态"""
