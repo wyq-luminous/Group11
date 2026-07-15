@@ -138,6 +138,7 @@ class Alerter:
         self._buzzer_on = False
         self._last_buzzer_toggle = 0.0
         self._buzzer_pattern = (0.15, 0.10)  # (on_sec, off_sec)
+        self._mode = None  # 当前显示模式，避免重复 RPC 调用
 
         # 蜂鸣器通过 MCU Bridge RPC 控制 (STM32 D2, LOW 触发)
         self._buzzer_rpc = True  # 使用 bridge RPC
@@ -172,8 +173,11 @@ class Alerter:
 
     def show_normal(self):
         """正常坐姿: 绿灯 + 点阵 ✓"""
+        if self._mode == "normal":
+            return  # 已在正常模式，跳过重复 RPC
+        self._mode = "normal"
         self._set_rgb(0, 1, 0)       # 绿灯亮
-        self._write_matrix("ok")  # 对勾图案
+        self._write_matrix("ok")     # 对勾图案
         self._write_buzzer(False)
         self._is_alerting = False
 
@@ -182,11 +186,13 @@ class Alerter:
         报警: 红色 LED + 三角感叹号 ⚠️ + 蜂鸣器间歇鸣叫
         主循环定期调用此方法，蜂鸣器自动间歇切换。
         """
-        self._set_rgb(1, 0, 0)           # 红灯亮
-        self._write_matrix("warning")  # 三角感叹号
+        if self._mode != "warning":
+            self._mode = "warning"
+            self._set_rgb(1, 0, 0)           # 红灯亮
+            self._write_matrix("warning")    # 三角感叹号（仅首次）
         self._is_alerting = True
 
-        # 间歇蜂鸣
+        # 间歇蜂鸣（每次 tick 都需评估，不跳帧）
         now = time.time()
         on_time, off_time = self._buzzer_pattern
         threshold = on_time if self._buzzer_on else off_time
@@ -194,11 +200,22 @@ class Alerter:
         if now - self._last_buzzer_toggle >= threshold:
             self._buzzer_on = not self._buzzer_on
             self._last_buzzer_toggle = now
+            self._write_buzzer(self._buzzer_on)
 
-        self._write_buzzer(self._buzzer_on)
+    def show_calibrating(self):
+        """校准中: 蓝灯 + 清空点阵 + 蜂鸣器静音"""
+        if self._mode == "calibrating":
+            return  # 已在校准模式，跳过重复 RPC
+        self._mode = "calibrating"
+        self._set_rgb(0, 0, 1)       # 蓝灯 = 校准中
+        self._clear_matrix()
+        self._write_buzzer(False)
+        self._buzzer_on = False
+        self._is_alerting = False
 
     def clear(self):
         """清空所有输出 (蜂鸣器停 + 矩阵灭 + 绿灯)"""
+        self._mode = None  # 强制下次 show_* 重新发送 RPC
         self._set_rgb(0, 1, 0)
         self._clear_matrix()
         self._write_buzzer(False)

@@ -37,6 +37,8 @@ MIN_KEYPOINT_CONFIDENCE = 0.6
 # ============================================================
 CALIBRATION_DURATION_SEC = 5.0    # 启动后自动采集的秒数
 CALIBRATION_MIN_SAMPLES = 10      # 最少有效样本数（不足则延长采集）
+CALIBRATION_COVER_SEC = 2.0       # 遮挡镜头触发重校准的持续秒数
+CALIBRATION_RECAL_FEEDBACK_SEC = 1.0  # 重校准完成后 LED 确认闪烁秒数
 
 # ============================================================
 # 双指标复合判定阈值

@@ -37,6 +37,7 @@ from config import (
     MIN_KEYPOINT_CONFIDENCE,
     # 校准
     CALIBRATION_DURATION_SEC, CALIBRATION_MIN_SAMPLES,
+    CALIBRATION_COVER_SEC, CALIBRATION_RECAL_FEEDBACK_SEC,
     # 阈值
     EYE_DISTANCE_RATIO_THRESHOLD, HEIGHT_DROP_THRESHOLD_PX,
     ALERT_PERSIST_SEC, ALERT_COOLDOWN_SEC,
@@ -74,6 +75,7 @@ class SharedState:
     def __init__(self):
         # ---- 系统控制 ----
         self.running = True
+        self.posture_state: str = "CALIBRATING"  # 当前 FSM 状态名（供 API 读取）
 
         # ---- 采集 → 推理 ----
         self.raw_lock = threading.Lock()
@@ -98,6 +100,11 @@ class SharedState:
         self.is_alerting: bool = False
         self.bad_posture_start: float | None = None  # 不良坐姿起始时间戳
         self.good_posture_start: float | None = None  # 恢复坐姿起始时间戳
+
+        # ---- 遮挡追踪（无感校准触发） ----
+        self.cover_lock = threading.Lock()
+        self.no_face_start: float | None = None   # 无人脸开始时间戳
+        self.pending_recal: bool = False          # 人脸恢复后需重新校准
 
     def stop(self):
         """通知所有线程停止"""
@@ -159,6 +166,29 @@ class SharedState:
     def set_alerting(self, alerting: bool):
         with self.alert_lock:
             self.is_alerting = alerting
+
+    # ---- 遮挡追踪接口（无感校准触发） ----
+    def mark_no_face(self, ts: float):
+        """记录无人脸开始时间（仅首次）"""
+        with self.cover_lock:
+            if self.no_face_start is None:
+                self.no_face_start = ts
+
+    def mark_face_restored(self) -> float | None:
+        """人脸恢复，返回遮挡持续秒数；若未在遮挡状态返回 None"""
+        with self.cover_lock:
+            if self.no_face_start is not None:
+                duration = time.time() - self.no_face_start
+                self.no_face_start = None
+                return duration
+            return None
+
+    def get_no_face_duration(self, now: float) -> float:
+        """返回当前无脸持续秒数"""
+        with self.cover_lock:
+            if self.no_face_start is None:
+                return 0.0
+            return now - self.no_face_start
 
 
 # ============================================================
@@ -455,6 +485,7 @@ class PostureAnalyzer:
     def __init__(self, state: SharedState):
         self.state = state
         self.posture = PostureState.CALIBRATING
+        self.state.posture_state = self.posture
         self.calibration_start = time.time()
         self.inference_ts = 0.0  # 上次推理时间戳
 
@@ -463,12 +494,16 @@ class PostureAnalyzer:
         每次主循环调用，返回是否应触发报警。
         """
         eye_distance, eye_y, face_detected = self.state.get_inference()
+        now = time.time()
 
         if not face_detected or eye_distance is None or eye_y is None:
-            # 未检测到人脸：不作判定，维持当前状态
-            return self.state.is_alerting
+            # 未检测到人脸：追踪遮挡时长，可能触发重校准
+            return self._handle_no_face(now)
 
-        now = time.time()
+        # 人脸存在 — 清除遮挡计时，检查是否需要重校准
+        self.state.mark_face_restored()
+        if self.state.pending_recal:
+            self._start_recalibration(now)
 
         if self.posture == PostureState.CALIBRATING:
             return self._handle_calibrating(eye_distance, eye_y, now)
@@ -480,7 +515,10 @@ class PostureAnalyzer:
             return self._handle_alerting(eye_distance, eye_y, now)
 
         elif self.posture == PostureState.WAITING_COOLDOWN:
-            return self._handle_cooldown(eye_distance, eye_y, now)
+            # COOLDOWN 状态为二期预留，当前回退到 MONITORING
+            self.posture = PostureState.MONITORING
+            self.state.posture_state = self.posture
+            return False
 
         return False
 
@@ -492,6 +530,7 @@ class PostureAnalyzer:
         if elapsed >= CALIBRATION_DURATION_SEC:
             if self.state.finalize_calibration():
                 self.posture = PostureState.MONITORING
+                self.state.posture_state = self.posture
                 logger.info(f"校准完成，进入监控状态")
             else:
                 logger.warning(f"校准样本不足 ({len(self.state.calibration_samples)}), 延长采集...")
@@ -527,6 +566,7 @@ class PostureAnalyzer:
 
             if elapsed_bad >= ALERT_PERSIST_SEC:
                 self.posture = PostureState.ALERTING
+                self.state.posture_state = self.posture
                 self.state.set_alerting(True)
                 logger.warning(f"⚠ 触发报警！{reason} | 持续 {elapsed_bad:.1f}s")
                 return True
@@ -548,6 +588,7 @@ class PostureAnalyzer:
 
             if elapsed_good >= ALERT_COOLDOWN_SEC:
                 self.posture = PostureState.MONITORING
+                self.state.posture_state = self.posture
                 self.state.set_alerting(False)
                 self.state.bad_posture_start = None
                 self.state.good_posture_start = None
@@ -557,6 +598,32 @@ class PostureAnalyzer:
             self.state.good_posture_start = None
 
         return True  # 继续报警
+
+    def _handle_no_face(self, now: float) -> bool:
+        """
+        无脸帧处理：追踪遮挡时长以触发重校准。
+        仅在 MONITORING 状态下检测遮挡（校准/报警期间不触发）。
+        """
+        self.state.mark_no_face(now)
+        duration = self.state.get_no_face_duration(now)
+
+        if self.posture == PostureState.MONITORING:
+            if duration >= CALIBRATION_COVER_SEC and not self.state.pending_recal:
+                self.state.pending_recal = True
+                logger.info(f"🔁 检测到遮挡 {duration:.1f}s ≥ {CALIBRATION_COVER_SEC}s，"
+                            f"人脸恢复后将重新校准")
+
+        return self.state.is_alerting
+
+    def _start_recalibration(self, now: float):
+        """人脸恢复后，重置校准数据并切入 CALIBRATING 状态"""
+        with self.state.calibration_lock:
+            self.state.calibration_samples.clear()
+        self.calibration_start = now
+        self.posture = PostureState.CALIBRATING
+        self.state.posture_state = self.posture
+        self.state.pending_recal = False
+        logger.info("🔄 开始重校准（遮挡触发）...")
 
 
 # ============================================================
@@ -596,6 +663,7 @@ def _create_fastapi_app(state: SharedState):
         Y_normal: float | None
         is_alerting: bool
         state: str
+        posture_state: str
 
     @app.post("/api/v1/calibration")
     async def set_calibration(req: CalibrationRequest):
@@ -620,6 +688,7 @@ def _create_fastapi_app(state: SharedState):
             Y_normal=y,
             is_alerting=state.is_alerting,
             state="running" if state.running else "stopped",
+            posture_state=state.posture_state,
         )
 
     @app.get("/api/v1/health")
@@ -742,8 +811,10 @@ def main():
             # 执行状态机判定
             should_alert = analyzer.tick()
 
-            # 控制报警硬件
-            if should_alert:
+            # 控制报警硬件（按状态区分反馈）
+            if analyzer.posture == PostureState.CALIBRATING:
+                alerter.show_calibrating()
+            elif should_alert:
                 alerter.show_warning()
             else:
                 alerter.show_normal()
