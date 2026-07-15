@@ -257,3 +257,82 @@ main      ← SmartPosture_Guardian (坐姿检测系统)
 
 **Agent 回复摘要**:
 LED 点阵恢复显示。Git 初始化完成，与队友共用同一个 Group11 仓库。系统现在完全正常：绿灯+对勾图案 = 正常监控，遮挡 3s+ = 蓝灯重校准。
+
+---
+
+## 第10轮 — Phase 3: 判定算法重构 + PFLD 模型替换 (2026-07-15)
+
+**用户 Prompt 摘要**:
+> 在现有坐姿监测系统上新增异常场景抗干扰（Phase 3）。核心发现：YuNet 5 点关键点在歪头/侧脸时无法准确追踪眼睛位置，十字始终一样高。用户要求换个能追踪五官位置的模型，只关注前倾/低头/歪头/侧脸四个判定场景，不扩展其他异常场景。
+
+**Agent 行动**:
+
+**问题诊断**:
+- 分析 YuNet DIAG 日志 → 证实歪头时 `ly ≠ ry` 但偏差被模型内部约束(约 10-15° 实际歪对应 10px ΔY)
+- YuNet 是正脸检测模型附带 5 个粗关键点，不是追踪模型
+- 眼距骤降 (84→25px) 是侧脸/丢点的可靠信号，但无法与后退区分
+
+**模型选型**:
+- MediaPipe: Python 3.13 + ARM64 无 wheel → 不可用
+- PFLD ONNX (98 点 WFLW): 1MB, 112×112 输入, 来自 HuggingFace `ykk648/face_lib`
+- 通过 `hf-mirror.com` 镜像下载成功 (6.6MB)
+
+**7 步原子化实施**:
+
+**Step 1 — 下载模型**: `models/pfpld.onnx` (6.6MB)
+- 直接连接 HuggingFace 超时，换 `hf-mirror.com` 镜像成功
+
+**Step 2 — Benchmark + 确定索引**:
+- 模型输出: `pose [1,3]` (yaw/pitch/roll) + `landms [1,196]` (98点×2)
+- WFLW 98 点格式: 左眼 60-67, 右眼 68-75, 鼻尖 57
+- ONNX Runtime: 109ms/帧 (9 FPS)；OpenCV DNN: 79ms/帧 (13 FPS)
+- 选择 OpenCV DNN 后端
+
+**Step 3 — 新增 `src/landmarker.py`**:
+- `FaceLandmarker` 类: 加载 PFLD ONNX via OpenCV DNN
+- `detect(face_crop)` → `LandmarkResult`: 眼距/眼Y/歪头角/侧脸比 + 16 个眼睛轮廓点 + 鼻尖
+- 质量门控: 眼距 < 15px → 判定异常
+
+**Step 4 — 改造 `YuNetEngine`**:
+- 新增 `detect_face_bbox()`: 只返回人脸边界框 (带 15% 边距)
+- 保留旧 `detect_eyes()` 作为回退
+
+**Step 5 — 串联推理链**:
+- `inference_loop`: YuNet 找脸框 → 裁剪 → PFLD 精确定位 → SharedState
+- 新增 `SharedState.update_landmark()` / `get_landmark()` 方法
+- 同步旧字段 (`eye_distance/eye_y/face_detected`) 供校准兼容
+- PFLD 缺失时自动回退到 YuNet 粗检测模式
+
+**Step 6 — 更新 `debug_viewer`**:
+- 支持新旧两种 eye_positions 格式
+- 新格式: 画 16 个绿色眼轮廓点 + 黄色中心大圆 + 紫色连线
+- 显示 `Roll/Yaw` 数值
+
+**Step 7 — 更新 `PostureAnalyzer` (四场景判定)**:
+- 侧脸 (`yaw_ratio > 0.35`): 丢弃帧，冻结计时器
+- 帧间跳变 (`|Δeye_dist| > 30%`): 丢弃帧，冻结计时器
+- 前倾 (`眼距比 > 1.2`): 计时
+- 低头 (`当前Y − 基准Y > 25px`): **修复公式 (之前写反了)**
+- 歪头 (`|roll_deg| > 12°`): 计时
+- 三指标任一持续 5s → 报警
+
+**变更文件清单**:
+| 文件 | 变更类型 |
+|------|------|
+| `models/pfpld.onnx` | 新增 (6.6MB) |
+| `src/config.py` | +1 行 (`PFLD_MODEL_PATH`) |
+| `src/landmarker.py` | 新增 (~140 行) |
+| `src/bench_pfld.py` | 新增 (benchmark 工具, ~140 行) |
+| `src/main.py` — SharedState | +20 行 (landmark 字段+方法) |
+| `src/main.py` — YuNetEngine | +35 行 (`detect_face_bbox`) |
+| `src/main.py` — inference_loop | 重写 (YuNet→PFLD 级联+回退) |
+| `src/main.py` — PostureAnalyzer | +40 行 (四场景判定+质量门控+修复低头公式) |
+| `src/debug_viewer.py` | +40 行 (16 点眼轮廓+Roll/Yaw 显示) |
+
+**性能**:
+- YuNet (~15ms) + PFLD OpenCV DNN (~79ms) = ~94ms/帧 → ~10 FPS 理论
+- 实测: ~6 FPS (含调试标注+JPEG 编码等开销)
+- 对坐姿判定 5s 窗口可收集 ~30 帧，足够
+
+**Agent 回复摘要**:
+7 步全部完成，系统正常运行。判定管线从"双指标 OR"升级为"三层质量门控 + 三指标 OR"。用户需在浏览器 `/viewer` 观察 16 个绿色眼轮廓点是否跟随歪头旋转，并逐一测试前倾/低头/歪头/侧脸四个场景。

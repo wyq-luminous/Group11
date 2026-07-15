@@ -26,6 +26,7 @@ CAMERA_BUFFERSIZE = 1             # V4L2 缓冲区大小（驱动可能忽略，
 # AI 模型 (MoveNet Lightning ONNX)
 # ============================================================
 MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "face_detection_yunet.onnx")
+PFLD_MODEL_PATH = os.path.join(PROJECT_ROOT, "models", "pfpld.onnx")
 MODEL_INPUT_SIZE_W = 320          # YuNet 输入宽度
 MODEL_INPUT_SIZE_H = 240          # YuNet 输入高度
 

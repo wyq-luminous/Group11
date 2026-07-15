@@ -27,12 +27,13 @@ import asyncio
 # 添加 src 目录到 path，确保能 import config
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from alerter import Alerter
+from landmarker import FaceLandmarker, LandmarkResult
 import debug_viewer
 from config import (
     # 摄像头
     CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, CAMERA_FOURCC, CAMERA_BUFFERSIZE,
     # 模型
-    MODEL_PATH,
+    MODEL_PATH, PFLD_MODEL_PATH,
     # 推理
     MIN_KEYPOINT_CONFIDENCE,
     # 校准
@@ -88,6 +89,11 @@ class SharedState:
         self.face_detected: bool = False            # 当前帧是否检测到人脸
         self.inference_timestamp: float = 0.0       # 推理完成时间戳
 
+        # ---- PFLD 关键点（替代上述粗粒度数据） ----
+        self.landmark_lock = threading.Lock()
+        self.landmark_result: LandmarkResult | None = None
+        self.eye_positions: list | None = None       # 供 debug_viewer 绘制
+
         # ---- 基准值（校准/动态注入） ----
         self.calibration_lock = threading.Lock()
         self.D_normal: float | None = None          # 基准眼距
@@ -130,6 +136,22 @@ class SharedState:
     def get_inference(self) -> tuple[float | None, float | None, bool]:
         with self.inference_lock:
             return self.eye_distance, self.eye_y, self.face_detected
+
+    def update_landmark(self, result: LandmarkResult, eye_positions: list | None = None):
+        """写入 PFLD 关键点检测结果，同时同步旧字段供校准兼容"""
+        with self.landmark_lock:
+            self.landmark_result = result
+            if eye_positions is not None:
+                self.eye_positions = eye_positions
+        with self.inference_lock:
+            self.eye_distance = result.eye_distance
+            self.eye_y = result.eye_y
+            self.face_detected = result.face_detected
+            self.inference_timestamp = time.time()
+
+    def get_landmark(self) -> LandmarkResult | None:
+        with self.landmark_lock:
+            return self.landmark_result
 
     # ---- 校准接口 ----
     def set_baseline(self, d_normal: float, y_normal: float):
@@ -398,30 +420,107 @@ class YuNetEngine(InferenceEngine):
 
         return eye_distance, eye_y, True
 
+    def detect_face_bbox(self, frame: np.ndarray) -> tuple | None:
+        """
+        仅检测人脸边界框（供 PFLD 级联使用）。
+        返回 (x, y, w, h, confidence) 或 None。
+        坐标已映射回原始分辨率，带 15% 边距。
+        """
+        h, w = frame.shape[:2]
+
+        resized = cv2.resize(frame, (self.INPUT_W, self.INPUT_H), interpolation=cv2.INTER_AREA)
+        self.detector.setInputSize((self.INPUT_W, self.INPUT_H))
+        faces = self.detector.detect(resized)
+
+        if faces[1] is None or len(faces[1]) == 0:
+            return None
+
+        face = faces[1][0]
+        score = face[14]
+        if score < self.SCORE_THRESHOLD:
+            return None
+
+        scale_x = w / self.INPUT_W
+        scale_y = h / self.INPUT_H
+
+        bx = float(face[0] * scale_x)
+        by = float(face[1] * scale_y)
+        bw = float(face[2] * scale_x)
+        bh = float(face[3] * scale_y)
+
+        # 扩展 15% 边距，确保眼睛/鼻尖不贴边
+        margin_x = bw * 0.15
+        margin_y = bh * 0.15
+        bx = max(0, bx - margin_x)
+        by = max(0, by - margin_y)
+        bw = min(w - bx, bw + margin_x * 2)
+        bh = min(h - by, bh + margin_y * 2)
+
+        return (int(bx), int(by), int(bw), int(bh), float(score))
+
 
 def inference_loop(state: SharedState):
     """
-    推理线程主循环：
+    推理线程主循环 (YuNet 检测人脸 → PFLD 精确定位关键点):
     - 从 shared_state 获取最新帧
-    - 跳过重复帧
-    - 推理 → 写入结果
+    - YuNet 检测人脸边界框
+    - PFLD 在裁剪区域精确定位 98 个关键点
+    - 提取 17 个坐姿相关点 + 派生指标 → 写入 SharedState
     """
     logger.info("推理线程启动")
 
-    # ---- 初始化推理引擎 ----
-    # 使用 YuNet ONNX（已下载到 models/ 目录）
+    # ---- 初始化 YuNet 人脸检测器 ----
     engine = None
-
     if os.path.exists(MODEL_PATH):
         try:
             engine = YuNetEngine(MODEL_PATH)
         except Exception as e:
             logger.warning(f"YuNet 初始化失败: {e}")
     else:
-        logger.warning(f"模型文件缺失: {MODEL_PATH}，请确保已下载 face_detection_yunet.onnx")
+        logger.warning(f"模型文件缺失: {MODEL_PATH}")
 
     if engine is None:
         logger.error("无可用的推理引擎，推理线程退出")
+        return
+
+    # ---- 初始化 PFLD 关键点定位器 ----
+    landmarker = None
+    if os.path.exists(PFLD_MODEL_PATH):
+        try:
+            landmarker = FaceLandmarker(PFLD_MODEL_PATH)
+        except Exception as e:
+            logger.warning(f"PFLD 初始化失败: {e}")
+    else:
+        logger.warning(f"PFLD 模型缺失: {PFLD_MODEL_PATH}")
+
+    if landmarker is None:
+        logger.error("无可用的关键点定位器，回退到 YuNet 粗检测模式")
+        # 回退：仍然用旧的 detect_eyes
+        last_frame_id = None
+        inference_count = 0
+        t_start = time.time()
+        while state.running:
+            frame = state.get_raw_frame()
+            if frame is None:
+                time.sleep(0.002)
+                continue
+            frame_id = id(frame)
+            if frame_id == last_frame_id:
+                time.sleep(0.002)
+                continue
+            last_frame_id = frame_id
+            try:
+                eye_distance, eye_y, face_detected = engine.detect_eyes(frame)
+            except Exception as e:
+                logger.error(f"推理异常: {e}")
+                time.sleep(0.01)
+                continue
+            state.update_inference(eye_distance, eye_y, face_detected)
+            state.eye_positions = engine.last_eye_positions
+            inference_count += 1
+            debug_viewer.process_debug_frame(state)
+        elapsed = time.time() - t_start
+        logger.info(f"推理线程已退出 ({inference_count} 次推理, {inference_count/elapsed:.1f} fps)")
         return
 
     last_frame_id = None
@@ -429,34 +528,61 @@ def inference_loop(state: SharedState):
     t_start = time.time()
 
     while state.running:
-        # 获取最新帧
         frame = state.get_raw_frame()
         if frame is None:
             time.sleep(0.002)
             continue
 
-        # 简单帧去重（避免对同一帧重复推理）
-        frame_id = id(frame)  # Python 对象 id，同帧复用相同内存
+        frame_id = id(frame)
         if frame_id == last_frame_id:
             time.sleep(0.002)
             continue
         last_frame_id = frame_id
 
-        # ---- 推理 ----
         try:
-            eye_distance, eye_y, face_detected = engine.detect_eyes(frame)
+            # ---- Stage 1: YuNet 检测人脸框 ----
+            bbox = engine.detect_face_bbox(frame)
+
+            if bbox is not None:
+                x, y, w_box, h_box, conf = bbox
+
+                # 边界安全检查
+                x = max(0, x)
+                y = max(0, y)
+                w_box = min(frame.shape[1] - x, w_box)
+                h_box = min(frame.shape[0] - y, h_box)
+
+                if w_box > 20 and h_box > 20:
+                    face_crop = frame[y:y + h_box, x:x + w_box]
+
+                    # ---- Stage 2: PFLD 精确定位 ----
+                    result = landmarker.detect(face_crop)
+
+                    if result.face_detected:
+                        # 映射关键点坐标回原始帧
+                        left_full = [(px + x, py + y) for px, py in result.left_eye_pts]
+                        right_full = [(px + x, py + y) for px, py in result.right_eye_pts]
+                        nose_full = (result.nose_pt[0] + x, result.nose_pt[1] + y)
+                        result.nose_pt = nose_full
+
+                        state.update_landmark(result, eye_positions=(left_full, right_full))
+                        inference_count += 1
+                        debug_viewer.process_debug_frame(state)
+                        continue
+
+                # 裁剪无效或 PFLD 未检测到关键点
+                state.update_landmark(LandmarkResult(), eye_positions=None)
+
+            else:
+                # YuNet 未检测到人脸
+                state.update_landmark(LandmarkResult(), eye_positions=None)
+
         except Exception as e:
-            logger.error(f"推理异常: {e}")
+            logger.error(f"推理异常: {e}", exc_info=True)
             time.sleep(0.01)
             continue
 
-        # 写入共享状态
-        state.update_inference(eye_distance, eye_y, face_detected)
-        if hasattr(state, 'eye_positions'):
-            state.eye_positions = engine.last_eye_positions
         inference_count += 1
-
-        # 调试视图: 生成标注帧 (仅在 debug_active 时)
         debug_viewer.process_debug_frame(state)
 
     elapsed = time.time() - t_start
@@ -488,34 +614,65 @@ class PostureAnalyzer:
         self.state.posture_state = self.posture
         self.calibration_start = time.time()
         self.inference_ts = 0.0  # 上次推理时间戳
+        self._last_eye_dist: float | None = None  # 帧间跳变检测
 
     def tick(self) -> bool:
         """
         每次主循环调用，返回是否应触发报警。
+
+        判定流水线:
+          1. 无人脸 → _handle_no_face (遮挡追踪)
+          2. 侧脸(yaw>0.35) → 丢弃帧，冻结计时器
+          3. 帧间跳变(>30%) → 丢弃帧，冻结计时器
+          4. 正常 → 三指标判定 (前倾/低头/歪头)
         """
-        eye_distance, eye_y, face_detected = self.state.get_inference()
+        # 读取 PFLD 关键点结果
+        lm = self.state.get_landmark()
         now = time.time()
 
+        # 兼容回退: 若无 landmark 数据则用旧接口
+        if lm is None:
+            eye_distance, eye_y, face_detected = self.state.get_inference()
+        else:
+            eye_distance = lm.eye_distance
+            eye_y = lm.eye_y
+            face_detected = lm.face_detected
+
         if not face_detected or eye_distance is None or eye_y is None:
-            # 未检测到人脸：追踪遮挡时长，可能触发重校准
+            self._last_eye_dist = None
             return self._handle_no_face(now)
 
         # 人脸存在 — 清除遮挡计时，检查是否需要重校准
         self.state.mark_face_restored()
         if self.state.pending_recal:
             self._start_recalibration(now)
+            self._last_eye_dist = None
+
+        # ---- 质量门控 (仅 MONITORING/ALERTING 状态下生效) ----
+        if lm is not None and self.posture in (PostureState.MONITORING, PostureState.ALERTING):
+            # 侧脸: 丢弃帧，冻结计时器
+            if lm.yaw_ratio > 0.35:
+                return self.state.is_alerting
+
+            # 帧间眼距跳变 > 30%: 丢弃帧，冻结计时器
+            if self._last_eye_dist is not None and self._last_eye_dist > 0:
+                jump = abs(eye_distance - self._last_eye_dist) / self._last_eye_dist
+                if jump > 0.30:
+                    self._last_eye_dist = eye_distance
+                    return self.state.is_alerting
+
+        self._last_eye_dist = eye_distance
 
         if self.posture == PostureState.CALIBRATING:
             return self._handle_calibrating(eye_distance, eye_y, now)
 
         elif self.posture == PostureState.MONITORING:
-            return self._handle_monitoring(eye_distance, eye_y, now)
+            return self._handle_monitoring(eye_distance, eye_y, now, lm)
 
         elif self.posture == PostureState.ALERTING:
-            return self._handle_alerting(eye_distance, eye_y, now)
+            return self._handle_alerting(eye_distance, eye_y, now, lm)
 
         elif self.posture == PostureState.WAITING_COOLDOWN:
-            # COOLDOWN 状态为二期预留，当前回退到 MONITORING
             self.posture = PostureState.MONITORING
             self.state.posture_state = self.posture
             return False
@@ -538,26 +695,36 @@ class PostureAnalyzer:
 
         return False  # 校准期间不报警
 
-    def _is_bad_posture(self, d: float, y: float) -> tuple[bool, str]:
-        """双指标复合判定（空间域）"""
+    def _is_bad_posture(self, d: float, y: float,
+                        roll_deg: float = 0.0) -> tuple[bool, str]:
+        """
+        三指标复合判定（空间域）:
+          - 前倾: 眼距比率 > 1.2
+          - 低头: 当前眼Y − 基准眼Y > 25px (正值=眼睛比基准低)
+          - 歪头: |眼线倾角| > 12°
+        """
         D_n, Y_n, calibrated = self.state.get_baseline()
         if not calibrated or D_n is None or Y_n is None:
             return False, ""
 
         ratio = d / D_n
-        drop = Y_n - y  # 正值 = 眼睛低于基准
+        drop = y - Y_n   # 修复: 低头时 y > Y_n → 正值
 
         reasons = []
         if ratio > EYE_DISTANCE_RATIO_THRESHOLD:
-            reasons.append(f"眼距比={ratio:.2f} > {EYE_DISTANCE_RATIO_THRESHOLD}")
+            reasons.append(f"前倾(眼距比={ratio:.2f})")
         if drop > HEIGHT_DROP_THRESHOLD_PX:
-            reasons.append(f"高度降={drop:.1f}px > {HEIGHT_DROP_THRESHOLD_PX}px")
+            reasons.append(f"低头(高度降={drop:.1f}px)")
+        if abs(roll_deg) > 12.0:
+            reasons.append(f"歪头(倾角={roll_deg:.1f}°)")
 
         return len(reasons) > 0, " | ".join(reasons)
 
-    def _handle_monitoring(self, d: float, y: float, now: float) -> bool:
+    def _handle_monitoring(self, d: float, y: float, now: float,
+                           lm=None) -> bool:
         """监控阶段：检测不良坐姿并累计时长"""
-        is_bad, reason = self._is_bad_posture(d, y)
+        roll = lm.roll_deg if lm else 0.0
+        is_bad, reason = self._is_bad_posture(d, y, roll)
 
         if is_bad:
             if self.state.bad_posture_start is None:
@@ -571,15 +738,16 @@ class PostureAnalyzer:
                 logger.warning(f"⚠ 触发报警！{reason} | 持续 {elapsed_bad:.1f}s")
                 return True
         else:
-            # 姿势恢复，重置计时器
             if self.state.bad_posture_start is not None:
                 self.state.bad_posture_start = None
 
         return False
 
-    def _handle_alerting(self, d: float, y: float, now: float) -> bool:
+    def _handle_alerting(self, d: float, y: float, now: float,
+                         lm=None) -> bool:
         """报警阶段：检查是否恢复"""
-        is_bad, _ = self._is_bad_posture(d, y)
+        roll = lm.roll_deg if lm else 0.0
+        is_bad, _ = self._is_bad_posture(d, y, roll)
 
         if not is_bad:
             if self.state.good_posture_start is None:
