@@ -39,6 +39,7 @@ from config import (
     # 校准
     CALIBRATION_DURATION_SEC, CALIBRATION_MIN_SAMPLES,
     CALIBRATION_COVER_SEC, CALIBRATION_RECAL_FEEDBACK_SEC,
+    UNATTENDED_TIMEOUT_SEC, UNATTENDED_WAKE_SEC, UNATTENDED_INFERENCE_INTERVAL,
     # 阈值
     EYE_DISTANCE_RATIO_THRESHOLD, HEIGHT_DROP_THRESHOLD_PX,
     ALERT_PERSIST_SEC, ALERT_COOLDOWN_SEC,
@@ -111,6 +112,10 @@ class SharedState:
         self.cover_lock = threading.Lock()
         self.no_face_start: float | None = None   # 无人脸开始时间戳
         self.pending_recal: bool = False          # 人脸恢复后需重新校准
+
+        # ---- 无人休眠追踪 ----
+        self.unattended_lock = threading.Lock()
+        self.face_detected_start: float | None = None  # 休眠期间检测到人脸的时间戳
 
     def stop(self):
         """通知所有线程停止"""
@@ -211,6 +216,25 @@ class SharedState:
             if self.no_face_start is None:
                 return 0.0
             return now - self.no_face_start
+
+    # ---- 无人休眠接口 ----
+    def mark_face_seen(self, ts: float):
+        """休眠期间检测到人脸（仅首次记录）"""
+        with self.unattended_lock:
+            if self.face_detected_start is None:
+                self.face_detected_start = ts
+
+    def mark_face_lost(self):
+        """人脸消失，清零休眠唤醒计时"""
+        with self.unattended_lock:
+            self.face_detected_start = None
+
+    def get_face_seen_duration(self, now: float) -> float:
+        """返回休眠期间连续有脸秒数"""
+        with self.unattended_lock:
+            if self.face_detected_start is None:
+                return 0.0
+            return now - self.face_detected_start
 
 
 # ============================================================
@@ -420,9 +444,11 @@ class YuNetEngine(InferenceEngine):
 
         return eye_distance, eye_y, True
 
-    def detect_face_bbox(self, frame: np.ndarray) -> tuple | None:
+    def detect_face_bbox(self, frame: np.ndarray,
+                         last_center: tuple | None = None) -> tuple | None:
         """
-        仅检测人脸边界框（供 PFLD 级联使用）。
+        检测人脸边界框（供 PFLD 级联使用）。
+        多人脸时: 选最大脸；面积接近时用 last_center 位置连续性裁决。
         返回 (x, y, w, h, confidence) 或 None。
         坐标已映射回原始分辨率，带 15% 边距。
         """
@@ -435,18 +461,49 @@ class YuNetEngine(InferenceEngine):
         if faces[1] is None or len(faces[1]) == 0:
             return None
 
-        face = faces[1][0]
-        score = face[14]
-        if score < self.SCORE_THRESHOLD:
-            return None
-
         scale_x = w / self.INPUT_W
         scale_y = h / self.INPUT_H
 
-        bx = float(face[0] * scale_x)
-        by = float(face[1] * scale_y)
-        bw = float(face[2] * scale_x)
-        bh = float(face[3] * scale_y)
+        # ---- 过滤低置信度人脸 ----
+        valid_faces = []
+        for f in faces[1]:
+            if f[14] >= self.SCORE_THRESHOLD:
+                valid_faces.append(f)
+
+        if not valid_faces:
+            return None
+
+        # ---- 选脸策略 ----
+        if len(valid_faces) == 1:
+            best = valid_faces[0]
+        else:
+            # 主策略：选最大脸（bbox 面积 w*h 最大）
+            def bbox_area(f):
+                return float(f[2] * f[3])
+
+            sorted_faces = sorted(valid_faces, key=bbox_area, reverse=True)
+            largest_area = bbox_area(sorted_faces[0])
+            runner_up_area = bbox_area(sorted_faces[1])
+
+            # 辅助策略：两张脸面积接近 (<20% 差距) 且有历史位置时，用位置连续性裁决
+            if (last_center is not None
+                    and largest_area > 0
+                    and (largest_area - runner_up_area) / largest_area < 0.20):
+                best = min(valid_faces, key=lambda f: (
+                    (float(f[0]) + float(f[2]) / 2 - last_center[0]) ** 2
+                    + (float(f[1]) + float(f[3]) / 2 - last_center[1]) ** 2
+                ))
+            else:
+                best = sorted_faces[0]
+
+        score = best[14]
+        if score < self.SCORE_THRESHOLD:
+            return None
+
+        bx = float(best[0] * scale_x)
+        by = float(best[1] * scale_y)
+        bw = float(best[2] * scale_x)
+        bh = float(best[3] * scale_y)
 
         # 扩展 15% 边距，确保眼睛/鼻尖不贴边
         margin_x = bw * 0.15
@@ -526,6 +583,7 @@ def inference_loop(state: SharedState):
     last_frame_id = None
     inference_count = 0
     t_start = time.time()
+    last_face_center = None  # 供多人脸选脸的位置连续性裁决
 
     while state.running:
         frame = state.get_raw_frame()
@@ -541,7 +599,7 @@ def inference_loop(state: SharedState):
 
         try:
             # ---- Stage 1: YuNet 检测人脸框 ----
-            bbox = engine.detect_face_bbox(frame)
+            bbox = engine.detect_face_bbox(frame, last_center=last_face_center)
 
             if bbox is not None:
                 x, y, w_box, h_box, conf = bbox
@@ -565,16 +623,21 @@ def inference_loop(state: SharedState):
                         nose_full = (result.nose_pt[0] + x, result.nose_pt[1] + y)
                         result.nose_pt = nose_full
 
+                        # 更新人脸中心位置（供多人脸选脸的位置连续性裁决）
+                        last_face_center = (x + w_box / 2, y + h_box / 2)
+
                         state.update_landmark(result, eye_positions=(left_full, right_full))
                         inference_count += 1
                         debug_viewer.process_debug_frame(state)
                         continue
 
                 # 裁剪无效或 PFLD 未检测到关键点
+                last_face_center = None
                 state.update_landmark(LandmarkResult(), eye_positions=None)
 
             else:
                 # YuNet 未检测到人脸
+                last_face_center = None
                 state.update_landmark(LandmarkResult(), eye_positions=None)
 
         except Exception as e:
@@ -584,6 +647,10 @@ def inference_loop(state: SharedState):
 
         inference_count += 1
         debug_viewer.process_debug_frame(state)
+
+        # 休眠状态降频：每秒仅推理 1 次，省 CPU
+        if state.posture_state == "UNATTENDED":
+            time.sleep(UNATTENDED_INFERENCE_INTERVAL)
 
     elapsed = time.time() - t_start
     fps = inference_count / elapsed if elapsed > 0 else 0
@@ -598,6 +665,7 @@ class PostureState:
     MONITORING = "MONITORING"     # 正常监控
     ALERTING = "ALERTING"         # 报警中
     WAITING_COOLDOWN = "COOLDOWN" # 报警后恢复等待
+    UNATTENDED = "UNATTENDED"     # 无人休眠
 
 
 class PostureAnalyzer:
@@ -641,6 +709,11 @@ class PostureAnalyzer:
         if not face_detected or eye_distance is None or eye_y is None:
             self._last_eye_dist = None
             return self._handle_no_face(now)
+
+        # ---- UNATTENDED 休眠状态: 优先路由（不执行质量门控和正常判定） ----
+        if self.posture == PostureState.UNATTENDED:
+            self._last_eye_dist = None
+            return self._handle_unattended(now, face_detected=True)
 
         # 人脸存在 — 清除遮挡计时，检查是否需要重校准
         self.state.mark_face_restored()
@@ -769,20 +842,59 @@ class PostureAnalyzer:
 
     def _handle_no_face(self, now: float) -> bool:
         """
-        无脸帧处理：追踪遮挡时长以触发重校准。
-        MONITORING / ALERTING / COOLDOWN 状态下均可触发。
+        无脸帧处理：
+          - <2s:  仅追踪遮挡时长
+          - 2-20s: 标记 pending_recal（遮挡重校准）
+          - ≥20s:  进入无人休眠
+        MONITORING / ALERTING / COOLDOWN / UNATTENDED 状态下均可触发重校准。
         """
         self.state.mark_no_face(now)
         duration = self.state.get_no_face_duration(now)
 
-        # 遮挡 ≥2s → 标记待重校准 (CALIBRATING 期间除外，免干扰正在进行的校准)
-        if self.posture != PostureState.CALIBRATING:
-            if duration >= CALIBRATION_COVER_SEC and not self.state.pending_recal:
-                self.state.pending_recal = True
-                logger.info(f"🔁 检测到遮挡 {duration:.1f}s ≥ {CALIBRATION_COVER_SEC}s，"
-                            f"人脸恢复后将重新校准")
+        if self.posture == PostureState.UNATTENDED:
+            # 休眠中无脸 → 清零唤醒计时器
+            self.state.mark_face_lost()
+            return False
 
-        # 无人脸时不报警
+        if self.posture == PostureState.CALIBRATING:
+            return False
+
+        # ≥20s 无脸 → 进入休眠（优先于遮挡重校准）
+        if duration >= UNATTENDED_TIMEOUT_SEC:
+            self.posture = PostureState.UNATTENDED
+            self.state.posture_state = self.posture
+            self.state.pending_recal = False  # 休眠不重校准
+            self.state.mark_face_lost()
+            logger.info(f"💤 进入无人休眠状态 (无脸 {duration:.0f}s)")
+            return False
+
+        # 2-20s 无脸 → 遮挡重校准
+        if duration >= CALIBRATION_COVER_SEC and not self.state.pending_recal:
+            self.state.pending_recal = True
+            logger.info(f"🔁 检测到遮挡 {duration:.1f}s ≥ {CALIBRATION_COVER_SEC}s，"
+                        f"人脸恢复后将重新校准")
+
+        return False
+
+    def _handle_unattended(self, now: float, face_detected: bool) -> bool:
+        """
+        休眠状态: 连续有脸 ≥3s → 唤醒回 MONITORING。
+        唤醒后不重校准（基准值未失效）。
+        """
+        if face_detected:
+            self.state.mark_face_seen(now)
+            seen = self.state.get_face_seen_duration(now)
+            if seen >= UNATTENDED_WAKE_SEC:
+                self.posture = PostureState.MONITORING
+                self.state.posture_state = self.posture
+                self.state.mark_face_lost()
+                # 清除遮挡状态，免唤醒后立即重校准
+                with self.state.cover_lock:
+                    self.state.no_face_start = None
+                logger.info(f"⏰ 从休眠唤醒 (连续有脸 {seen:.1f}s)，进入监控状态")
+                return False
+        else:
+            self.state.mark_face_lost()
         return False
 
     def _start_recalibration(self, now: float):
@@ -984,6 +1096,8 @@ def main():
             # 控制报警硬件（按状态区分反馈）
             if analyzer.posture == PostureState.CALIBRATING:
                 alerter.show_calibrating()
+            elif analyzer.posture == PostureState.UNATTENDED:
+                alerter.show_unattended()
             elif should_alert:
                 alerter.show_warning()
             else:

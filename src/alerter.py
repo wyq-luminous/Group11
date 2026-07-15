@@ -139,6 +139,7 @@ class Alerter:
         self._last_buzzer_toggle = 0.0
         self._buzzer_pattern = (0.15, 0.10)  # (on_sec, off_sec)
         self._mode = None  # 当前显示模式，避免重复 RPC 调用
+        self._last_green_state = True  # 休眠闪烁状态追踪
 
         # 蜂鸣器通过 MCU Bridge RPC 控制 (STM32 D2, LOW 触发)
         self._buzzer_rpc = True  # 使用 bridge RPC
@@ -212,6 +213,29 @@ class Alerter:
         self._write_buzzer(False)
         self._buzzer_on = False
         self._is_alerting = False
+
+    def show_unattended(self):
+        """
+        无人休眠: 绿灯慢闪 (0.5s 亮 / 1.5s 灭) + 点阵清空 + 蜂鸣器静音。
+        主循环定期调用，自动间歇切换 LED。
+        """
+        if self._mode != "unattended":
+            self._mode = "unattended"
+            self._clear_matrix()
+            self._write_buzzer(False)
+            self._buzzer_on = False
+            self._is_alerting = False
+
+        # 绿灯慢闪
+        now = time.time()
+        on_time, off_time = 0.5, 1.5
+        threshold = on_time if self._last_green_state else off_time
+
+        if now - self._last_buzzer_toggle >= threshold:
+            self._last_green_state = not self._last_green_state
+            self._last_buzzer_toggle = now
+            # 复用 _last_buzzer_toggle 做 LED 闪烁计时（休眠时不操作蜂鸣器，字段可安全复用）
+            self._set_rgb(0, 1 if self._last_green_state else 0, 0)
 
     def clear(self):
         """清空所有输出 (蜂鸣器停 + 矩阵灭 + 绿灯)"""

@@ -353,3 +353,52 @@ LED 点阵恢复显示。Git 初始化完成，与队友共用同一个 Group11 
 
 **Agent 回复摘要**:
 提交 `b921205`，推送至 GitHub。用户确认遮挡重校准正常。
+
+---
+
+## 第12轮 — Phase 4 异常场景鲁棒性: 4A 第二人干扰 + 4B 无人休眠 (2026-07-15)
+
+**用户 Prompt 摘要**:
+> Phase 4 异常场景鲁棒性设计。用户要求先聚焦 4A(第二人入画干扰)和 4B(无人状态休眠)，讨论需求和判断标准后再实现。4C-4E 暂不改动，4F 暂不展开。
+
+**讨论决策**:
+
+**4A — 第二人干扰**:
+- 确认场景存在但低频，无需增加模型推理负担
+- 策略: 主策略选最大脸(bbox 面积)，辅助策略当多脸面积接近(<20%)时用上一帧位置连续性裁决
+- 改动量小，仅改 `detect_face_bbox()` 选脸逻辑 + `inference_loop` 历史位置追踪
+
+**4B — 无人休眠**:
+- 确认需要，20s 无脸进入休眠(方便测试)，连续有脸 3s 唤醒
+- 休眠行为: 绿灯慢闪(0.5s/1.5s) + 推理降频至 1fps + 蜂鸣器静音
+- 唤醒后直接进入 MONITORING，不重校准（基准值未失效）
+- 与遮挡重校准区分: 2-20s 无脸 = 遮挡重校准，≥20s = 休眠
+
+**实施: 7 步原子化改动**:
+
+| 步骤 | 文件 | 改动 |
+|------|------|------|
+| B1 | `config.py` | +3 常量 (UNATTENDED_TIMEOUT_SEC=20, WAKE=3, INFERENCE_INTERVAL=1.0) |
+| B2 | `main.py` SharedState | +unattended_lock + face_detected_start + 3 方法 (mark_face_seen/lost/get_face_seen_duration) |
+| A1 | `main.py` YuNetEngine | detect_face_bbox 新增 last_center 参数，多人脸时选最大脸(w*h)，面积差<20%时用位置连续性裁决 |
+| A2 | `main.py` inference_loop | +last_face_center 变量，成功检测后更新、无脸时清零，传给 detect_face_bbox |
+| B3 | `main.py` PostureAnalyzer | +UNATTENDED 状态, _handle_no_face 增加≥20s→休眠转换, +_handle_unattended(3s 唤醒), tick()增加休眠路由 |
+| B4 | `alerter.py` | +show_unattended() 绿灯慢闪 0.5s/1.5s (+_last_green_state 字段) |
+| B5 | `main.py` 主循环+推理 | 主循环增加 UNATTENDED 分支调 show_unattended(), 推理休眠时 sleep 1s 降频 |
+
+**变更文件清单**:
+| 文件 | 变更类型 |
+|------|------|
+| `src/config.py` | +7 行 |
+| `src/main.py` | +142 行 / -21 行 |
+| `src/alerter.py` | +24 行 |
+
+**完整状态机**:
+```
+CALIBRATING → MONITORING ⇄ ALERTING → COOLDOWN
+                   ↓ ↑
+              UNATTENDED  (20s 无脸 → 休眠, 3s 有脸 → 唤醒)
+```
+
+**Agent 回复摘要**:
+7 步全部完成，用户测试确认 4A(多人脸选最大脸+位置连续性)和 4B(20s 休眠+3s 唤醒+绿灯慢闪)功能正常。提交并推送至 GitHub。
