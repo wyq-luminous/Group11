@@ -223,3 +223,37 @@ main      ← SmartPosture_Guardian (坐姿检测系统)
 
 **Agent 回复摘要**:
 5 步全部独立验证通过。核心链路: `MONITORING → (无脸≥2s) → pending_recal=True → (人脸恢复) → CALIBRATING → (校准完成) → MONITORING`。未破坏原有启动校准和 API 注入校准功能。
+
+---
+
+## 第9轮 — LED 点阵不显示排查 & Git 初始化 (2026-07-15)
+
+**用户 Prompt 摘要**:
+> 校准功能正常但 LED 点阵不显示图案了。蓝灯（ble）也不亮了是否正常？应该有 git 仓库，队友之前上传过。
+
+**Agent 行动**:
+
+**LED 点阵问题排查**:
+1. 检查 Bridge socket → 存在，arduino-router 运行中
+2. 直接测试 RPC 调用 → `"method ok not available"` — MCU 方法未注册
+3. 读取 MCU sketch (`sketch.ino`) → 代码中有 `ok/warning/buzzer_on/buzzer_off` 方法
+4. `arduino-app-cli app list` → `user:posture_alerter` 状态 **stopped**
+5. **根因**: MCU 固件根本没在运行。之前的亮灯只是 sysfs LED（user-red1/green1/blue1），点阵由 MCU 独立控制
+6. 执行 `arduino-app-cli app start user:posture_alerter` → 编译成功，烧录成功
+7. 验证所有 5 个 RPC 方法 → 全部可用
+8. 蓝灯（bt-blue2 蓝牙指示灯）不亮 → 正常，MCU 重烧后蓝牙被重置，与代码无关
+
+**Alerter RPC 去重修复（次要根因）**:
+- 即使 MCU 固件正常，`show_calibrating()` 每秒 20 次 `_clear_matrix()` RPC 也会把 Bridge 打挂
+- 修复: Alerter 增加 `_mode` 状态追踪，只在模式切换时发送一次 matrix RPC
+- `show_normal/show_calibrating` 首次调用后 `return` 跳过，`show_warning` 只发一次 matrix 但蜂鸣器仍每 tick 评估
+
+**Git 初始化**:
+- 搜索 `/home/arduino` → git 仓库在 `~/workshop1-unoq-status-web/`，不在 `~/SmartPosture_Guardian/`
+- 远程: `git@github.com:wyq-luminous/Group11.git`，3 分支 (main/workshop1/workshop3)
+- 在 `~/SmartPosture_Guardian/` 执行 `git init` → 关联同一 remote → fetch origin/main → reset --soft
+- 使用队友相同身份 (`Arduino UNO-Q <arduino@unoq.local>`) 提交
+- 成功 push 到 GitHub
+
+**Agent 回复摘要**:
+LED 点阵恢复显示。Git 初始化完成，与队友共用同一个 Group11 仓库。系统现在完全正常：绿灯+对勾图案 = 正常监控，遮挡 3s+ = 蓝灯重校准。
