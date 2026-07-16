@@ -623,3 +623,81 @@ Hermes Agent cron (每 1min) → deliver_alerts.sh → stdout → 微信
 | `deploy/smartposture-guardian.service` | 新增 (systemd user service) |
 | `docs/OPERATIONS_MANUAL.md` | 新增 (~400 行, 完整运维手册) |
 | `docs/DevLog.md` | 追加 (本条目) |
+
+---
+
+## 第17轮 — LED 点阵不显示 & 蜂鸣器不响 Bug 修复 (2026-07-16)
+
+**用户 Prompt 摘要**:
+> 修 bug: 1. LED 点阵不显示（之前也发生过）2. 蜂鸣器不响（硬件测试正常）
+
+**Agent 采取的主要行动**:
+
+### Phase 1: 根因调查
+
+1. 读取 DevLog → 发现第 9 轮记录过完全相同的 LED 问题
+2. 读取 `alerter.py`、`main.py`、MCU sketch (`sketch.ino`) → 理解 Bridge RPC 通信链路
+3. 检查系统状态:
+   - `/var/run/arduino-router.sock` 存在 ✅
+   - `systemctl --user status smartposture-guardian.service` → Python 进程运行中 ✅
+   - `arduino-app-cli app list` → `user:posture_alerter` 状态 **stopped** ❌
+4. 直接测试 Bridge RPC → 返回 `"method ok not available"` — MCU 未注册任何方法
+5. **根因确认**: MCU 固件 `user:posture_alerter` 处于 stopped 状态，与第 9 轮完全相同的故障模式
+
+**为什么 LED 和蜂鸣器同时失效**:
+- 两者都通过 Bridge RPC (`/var/run/arduino-router.sock` + MsgPack) 控制
+- LED 点阵: Python → `_rpc_call("ok"/"warning"/"clear")` → STM32 `rpc_ok()/rpc_warning()/rpc_clear()`
+- 蜂鸣器: Python → `_rpc_call("buzzer_on"/"buzzer_off")` → STM32 `rpc_buzzer_on()/rpc_buzzer_off()` (D2, LOW 触发)
+- MCU 固件 stopped → 所有 RPC 方法不可用 → 两个硬件同时失效
+
+### Phase 2: 立即修复
+
+`arduino-app-cli app start user:posture_alerter` → 编译 + 烧录 + 容器启动成功，5 个 RPC 方法全部验证通过 (`ok/warning/clear/buzzer_on/buzzer_off`)
+
+### Phase 3: 永久修复（防止再次发生）
+
+**根本问题**: systemd 服务只启动了 Python 代码，没有启动 MCU 固件。系统重启后 MCU 固件停止，需要手动启动。
+
+**两处修复**:
+
+1. **systemd 服务增加 `ExecStartPre`** (`deploy/smartposture-guardian.service`):
+   ```
+   ExecStartPre=/usr/bin/arduino-app-cli app start user:posture_alerter
+   ExecStartPre=/bin/sleep 2
+   ```
+   确保每次 Python 启动前 MCU 固件已就绪。2 秒冷却让容器完全初始化。
+
+2. **alerter.py RPC 错误日志升级**:
+   - `_write_buzzer`: 原来完全忽略返回值 → 增加 WARNING 级别日志
+   - `_write_matrix`: DEBUG → WARNING（之前即使失败也看不到日志）
+   - `_clear_matrix`: 原来完全忽略返回值 → 增加 WARNING 级别日志
+   
+   这样即使 MCU 固件未运行，日志中也能立即看到 RPC 失败警告。
+
+### 验证结果
+
+| 测试项 | 结果 |
+|--------|------|
+| MCU 固件状态 | `running` ✅ |
+| `ok` RPC | `[1, 1, None, None]` ✅ |
+| `warning` RPC | `[1, 1, None, None]` ✅ |
+| `clear` RPC | `[1, 1, None, None]` ✅ |
+| `buzzer_on` RPC | `[1, 1, None, None]` ✅ |
+| `buzzer_off` RPC | `[1, 1, None, None]` ✅ |
+| 系统校准 | 5 秒完成，进入 MONITORING ✅ |
+| 姿态检测 | 正常触发报警 ✅ |
+| 日志无 RPC 错误 | 无 WARNING ✅ |
+
+### 关键教训
+
+**MCU 固件 ≠ Python 进程** — 两者独立管理，必须都启动。systemd 只管理 Python 进程，MCU 固件的自启需要通过 `ExecStartPre` 显式保证。这是第 9 轮和第 17 轮重复出现的同一故障模式，现已从架构层面根治。
+
+**Agent 回复摘要**:
+根因是 MCU 固件 `user:posture_alerter` stopped（与第 9 轮相同的故障模式）。立即启动固件恢复功能。永久修复：systemd service 增加 `ExecStartPre` 自动启动 MCU 固件，alerter.py 增加 RPC 失败日志。下次重启不会复现。
+
+**变更文件清单**:
+| 文件 | 变更类型 |
+|------|------|
+| `deploy/smartposture-guardian.service` | +2 行 (`ExecStartPre`) |
+| `src/alerter.py` | ~6 行 (RPC 错误日志) |
+| `docs/DevLog.md` | 追加 (本条目) |

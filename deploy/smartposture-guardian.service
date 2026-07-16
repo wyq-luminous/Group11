@@ -7,6 +7,9 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# 确保 MCU 固件先启动（LED 点阵 + 蜂鸣器依赖 STM32 Bridge RPC）
+ExecStartPre=/usr/bin/arduino-app-cli app start user:posture_alerter
+ExecStartPre=/bin/sleep 2
 ExecStart=/usr/bin/python3 /home/arduino/SmartPosture_Guardian/src/main.py
 WorkingDirectory=/home/arduino/SmartPosture_Guardian
 Environment="PATH=/home/arduino/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

@@ -149,20 +149,23 @@ class Alerter:
 
     def _write_buzzer(self, on: bool):
         """控制蜂鸣器 (通过 STM32 Bridge RPC)"""
-        if on:
-            _rpc_call("buzzer_on")
-        else:
-            _rpc_call("buzzer_off")
+        result = _rpc_call("buzzer_on" if on else "buzzer_off")
+        if not result.get("ok"):
+            logger.warning("蜂鸣器 RPC 失败 (%s): %s",
+                           "buzzer_on" if on else "buzzer_off",
+                           result.get("error", "unknown"))
 
     def _write_matrix(self, method: str):
         """调用 MCU RPC 显示预定图案"""
         result = _rpc_call(method)
         if not result.get("ok"):
-            logger.debug(f"LED matrix RPC 失败 ({method}): {result.get('error', 'unknown')}")
+            logger.warning("LED 点阵 RPC 失败 (%s): %s", method, result.get("error", "unknown"))
 
     def _clear_matrix(self):
         """清空 LED 点阵"""
-        _rpc_call("clear")
+        result = _rpc_call("clear")
+        if not result.get("ok"):
+            logger.warning("LED 点阵 RPC 失败 (clear): %s", result.get("error", "unknown"))
 
     def _set_rgb(self, r: int, g: int, b: int):
         """设置板载 RGB LED1"""
