@@ -324,11 +324,12 @@ def capture_loop(state: SharedState):
                 logger.warning(f"摄像头连续 {MAX_FAILURES} 次读取失败，尝试重连...")
                 cap.release()
                 time.sleep(1.0)
-                cap = cv2.VideoCapture(CAMERA_INDEX)
+                cap = cv2.VideoCapture(camera_idx)
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*CAMERA_FOURCC))
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
                 cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, CAMERA_BUFFERSIZE)
                 consecutive_failures = 0
             time.sleep(0.01)
             continue
@@ -1058,6 +1059,15 @@ def main():
 
     state = SharedState()
 
+    # ---- 关闭蓝牙指示灯（项目当前未使用蓝牙，避免误导） ----
+    _bt_led = "/sys/class/leds/unoq:bt-blue2/brightness"
+    if os.path.exists(_bt_led):
+        try:
+            with open(_bt_led, "w") as f:
+                f.write("0")
+        except Exception:
+            pass
+
     # ---- 初始化调试视图 (按钮 + MJPEG 流) ----
     debug_viewer.init_debug_viewer(state)
 
@@ -1076,6 +1086,12 @@ def main():
         threading.Thread(target=inference_loop, args=(state,), name="Inference", daemon=True),
     ]
 
+    thread_targets = {
+        "API": api_server_thread,
+        "Capture": capture_loop,
+        "Inference": inference_loop,
+    }
+
     for t in threads:
         t.start()
         time.sleep(0.1)  # 错开启动，日志可读
@@ -1086,9 +1102,41 @@ def main():
 
     logger.info("进入主循环（状态机 + 报警控制）")
 
+    # ---- 线程健康监控状态 ----
+    MAX_THREAD_RESTARTS = 3
+    thread_restarts: dict[str, int] = {"API": 0, "Capture": 0, "Inference": 0}
+    last_health_check = time.time()
+
     try:
         while state.running:
             loop_start = time.time()
+
+            # ---- 子线程健康检查 (每 2 秒) ----
+            if loop_start - last_health_check >= 2.0:
+                last_health_check = loop_start
+                for i, t in enumerate(threads):
+                    if not t.is_alive():
+                        name = t.name
+                        restarts = thread_restarts.get(name, 0)
+                        if restarts < MAX_THREAD_RESTARTS:
+                            thread_restarts[name] = restarts + 1
+                            logger.warning(
+                                "线程 [%s] 已停止，尝试重启 (%d/%d)",
+                                name, restarts + 1, MAX_THREAD_RESTARTS,
+                            )
+                            time.sleep(0.5)  # 短暂冷却，避免端口/设备未释放
+                            new_t = threading.Thread(
+                                target=thread_targets[name],
+                                args=(state,),
+                                name=name,
+                                daemon=True,
+                            )
+                            new_t.start()
+                            threads[i] = new_t
+                        else:
+                            logger.error(
+                                "线程 [%s] 已达最大重启次数 (%d)，放弃", name, MAX_THREAD_RESTARTS,
+                            )
 
             # 执行状态机判定
             should_alert = analyzer.tick()

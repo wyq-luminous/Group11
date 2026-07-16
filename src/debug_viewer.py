@@ -24,7 +24,8 @@ logger = logging.getLogger("guardian.debug_viewer")
 def annotate_frame(frame: np.ndarray, eye_distance: Optional[float],
                    eye_y: Optional[float], eye_positions: Optional[list],
                    face_detected: bool,
-                   roll_deg: float = 0.0, yaw_ratio: float = 0.0) -> np.ndarray:
+                   roll_deg: float = 0.0, yaw_ratio: float = 0.0,
+                   nose_pt: Optional[tuple] = None) -> np.ndarray:
     """空间域像素操作，标注眼睛轮廓(16点)或中心十字(兼容旧2点格式)"""
     annotated = frame.copy()
 
@@ -70,6 +71,13 @@ def annotate_frame(frame: np.ndarray, eye_distance: Optional[float],
             cv2.line(annotated, (rx, ry - cs), (rx, ry + cs), (0, 255, 255), 2)
             cv2.circle(annotated, (rx, ry), 8, (0, 255, 0), 1)
             cv2.line(annotated, (lx, ly), (rx, ry), (255, 0, 255), 1)
+
+        # ---- 鼻尖标注 (PFLD 提取) ----
+        if nose_pt is not None and nose_pt[0] > 0:
+            nx, ny = int(nose_pt[0]), int(nose_pt[1])
+            mid_x, mid_y = (lx + rx) // 2, (ly + ry) // 2
+            cv2.circle(annotated, (nx, ny), 5, (255, 165, 0), -1)  # 橙色实心圆
+            cv2.line(annotated, (mid_x, mid_y), (nx, ny), (255, 165, 0), 1)  # 中线→鼻尖连线
 
         # 眼距数字 (两种格式共用)
         mid_x, mid_y = (lx + rx) // 2, (ly + ry) // 2 - 15
@@ -155,14 +163,17 @@ def process_debug_frame(state) -> Optional[bytes]:
     # 读取 PFLD 派生指标 (如果有)
     roll_deg = 0.0
     yaw_ratio = 0.0
+    nose_pt = None
     lm_result = state.get_landmark()
     if lm_result is not None:
         roll_deg = lm_result.roll_deg
         yaw_ratio = lm_result.yaw_ratio
+        nose_pt = lm_result.nose_pt
 
     annotated = annotate_frame(frame, eye_distance, eye_y,
                                state.eye_positions, face_detected,
-                               roll_deg=roll_deg, yaw_ratio=yaw_ratio)
+                               roll_deg=roll_deg, yaw_ratio=yaw_ratio,
+                               nose_pt=nose_pt)
     jpeg = _mjpeg_stream.encode(annotated, quality=55)
     _mjpeg_stream.update(jpeg)
     return jpeg

@@ -402,3 +402,44 @@ CALIBRATING → MONITORING ⇄ ALERTING → COOLDOWN
 
 **Agent 回复摘要**:
 7 步全部完成，用户测试确认 4A(多人脸选最大脸+位置连续性)和 4B(20s 休眠+3s 唤醒+绿灯慢闪)功能正常。提交并推送至 GitHub。
+
+---
+
+## 第13轮 — 生产就绪修复: 线程健康监控 + 摄像头重连纠错 + 可视化补全 (2026-07-16)
+
+**用户 Prompt 摘要**:
+对整个项目进行"生产就绪健康检查与轻量重构"。用户明确要求只修最薄弱两处，不动功能代码。后续追加: 关闭蓝牙指示灯、可视化补上鼻尖点。
+
+**Agent 采取的主要行动**:
+
+### 第一阶段 — 诊断
+扫描全部 7 个 Python 源文件，列出 12 处异常处理器 + 5 大危险点。
+
+### 第二阶段 — 聚焦两处致命修复
+
+**Fix #1: 摄像头重连设备索引错误 (main.py:327)**
+- **Bug**: `_find_usb_camera()` 正确发现了 USB 摄像头索引 (如 `/dev/video2`)，但重连时硬编码用了 `CAMERA_INDEX` (=0)，在 UNO-Q 上 `/dev/video0` 是 Venus 编解码器 → 重连 100% 失败
+- **修复**: `cv2.VideoCapture(CAMERA_INDEX)` → `cv2.VideoCapture(camera_idx)`，并补上漏配的 `CAP_PROP_BUFFERSIZE`
+
+**Fix #2: 子线程静默死亡无感知 (main.py:1072-1110)**
+- **Bug**: 三个 daemon 线程 (API/Capture/Inference) 任何一个崩溃，主线程完全不知情，系统表面"运行中"实际已废
+- **修复**: 主循环每 2 秒检查 `thread.is_alive()`，发现死亡则 0.5s 冷却后重启，最多 3 次，超过记 ERROR 放弃
+
+### 后续追加
+
+**Fix #3: 蓝牙指示灯关闭 (main.py:1062-1068)**
+- `bt-blue2` 是 STM32 固件的蓝牙状态灯，项目未使用蓝牙但启动时可能亮起
+- 在 `main()` 启动时写入 0 关闭，以后用蓝牙再删
+
+**Fix #4: 鼻尖可视化 (debug_viewer.py)**
+- `landmarker.py` 一直提取鼻尖用于 yaw_ratio 计算，但 `debug_viewer.py` 从未绘制
+- 新增橙色实心圆 + 中线→鼻尖连线，刷新 /viewer 可见
+
+**Agent 回复摘要**:
+四姐妹修复均仅改动必要代码，零功能变更、零新依赖。语法验证通过。用户确认后要求记录 DevLog 并推送。
+
+**变更文件清单**:
+| 文件 | 变更类型 |
+|------|------|
+| `src/main.py` | +38 行 / -2 行 (线程健康监控 + 摄像头索引修复 + BT LED 关闭) |
+| `src/debug_viewer.py` | +7 行 / -2 行 (鼻尖标注) |
