@@ -89,6 +89,15 @@ _sys_haar = "/usr/share/opencv4/haarcascades"
 HAARCASCADE_DIR = _sys_haar if os.path.isdir(_sys_haar) else cv2.data.haarcascades
 
 # ============================================================
+# Hermes 微信告警推送 (文件队列 + Hermes Agent cron 投递)
+# 对齐 Workshop 6 (Group11/ws6-remote-control) 验证过的模式:
+#   Python → 写 alerts.jsonl → Hermes cron → deliver_alerts.sh → stdout → 微信
+# ============================================================
+HERMES_ENABLED = True                    # 总开关：False 则静默跳过所有告警写入
+HERMES_COOLDOWN_SEC = 60                 # 推送冷却期，首次写入后 N 秒内不再重复写文件
+HERMES_ALERT_FILE = "alerts.jsonl"       # 告警事件队列文件（相对项目根目录）
+
+# ============================================================
 # 日志
 # ============================================================
 LOG_DIR = os.path.join(PROJECT_ROOT, "logs")

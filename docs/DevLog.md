@@ -443,3 +443,118 @@ CALIBRATING → MONITORING ⇄ ALERTING → COOLDOWN
 |------|------|
 | `src/main.py` | +38 行 / -2 行 (线程健康监控 + 摄像头索引修复 + BT LED 关闭) |
 | `src/debug_viewer.py` | +7 行 / -2 行 (鼻尖标注) |
+
+---
+
+## 第14轮 — Hermes 云端推送模块 (2026-07-16)
+
+**用户 Prompt 摘要**:
+> 新增 Hermes 云端推送模块。当异常坐姿成立时，同时触发本地报警和 Hermes 微信推送。首次推送后 1 分钟冷却期。异步非阻塞 + 网络容错。参考 @lav1e2nrose 的 Group11/ws6-remote-control 仓库风格编写。
+
+**Agent 采取的主要行动**:
+
+### 参考仓库分析
+1. 通过 GitHub API 成功访问 `wyq-luminous/Group11` (ws6-remote-control 分支)
+2. 分析关键文件：`bin/monitor.py` (AlertTracker 冷却模式), `backend/hw.py` (硬件抽象), `backend/rpc_client.py` (RPC 客户端)
+3. **关键发现**: 参考仓库使用"文件队列 + Hermes cron + stdout 投递"模式做推送，不直接 HTTP。本项目需要直接 HTTP POST 到 Hermes 云端 API。
+4. **可复用模式**: `AlertTracker` 的冷却追踪模式 (debounce + cooldown 按时间戳判断，纯窗口逻辑)
+
+### 实施 (3 文件)
+
+**Step 1 — `src/config.py`**: 新增 6 行 Hermes 配置
+- `HERMES_ENABLED` (总开关)
+- `HERMES_API_URL` (云端端点)
+- `HERMES_COOLDOWN_SEC = 60` (冷却 1 分钟，调试用)
+- `HERMES_REQUEST_TIMEOUT_SEC = 5.0`
+- `HERMES_RETRY_COUNT = 1`
+- API Key 从环境变量 `HERMES_API_KEY` 读取，不硬编码
+
+**Step 2 — `src/hermes.py`** (新增 ~160 行):
+- `HermesPusher` 轻量类，模仿 Workshop 6 AlertTracker 风格
+- `try_push(reason)`: 主线程调用 → 检查冷却(线程安全) → spawn daemon 线程发送 HTTP POST
+- `_do_push(reason)`: 后台线程执行 `requests.post()` + 重试 + 静默容错
+- 冷却机制: 纯时间窗口 (60s)，与姿势恢复无关。距上次成功推送不足 60s 则静默跳过
+- 网络容错: `ConnectionError/Timeout/Exception` 三层捕获，仅写日志，绝不崩溃
+- 包含 `__main__` 自测块 (冷却逻辑、容错、非阻塞三项验证)
+
+**Step 3 — `src/main.py`** 集成:
+- `PostureAnalyzer.__init__` 新增可选的 `hermes` 参数
+- `_handle_monitoring()` 状态转入 ALERTING 时调用 `self.hermes.try_push(reason)`
+- `main()` 中实例化 `HermesPusher()` 并注入 `PostureAnalyzer`
+
+### 验证结果
+- 模块导入 ✓
+- 冷却逻辑: 首次触发推送 / 60s 内跳过 ✓
+- 网络容错: URL 不可达 → warning 日志 → 程序继续运行 ✓
+- 非阻塞: `try_push()` 返回耗时 1.6ms (daemon 线程异步) ✓
+- PostureAnalyzer 集成: hermes 正确注入 ✓
+
+**Agent 回复摘要**:
+3 文件变更完成。Hermes 推送在 ALERTING 首次触发时非阻塞发送，60s 冷却防重复，网络异常静默容错。用户需设置 `HERMES_API_KEY` 环境变量和实际的 `HERMES_API_URL` 端点。
+
+**变更文件清单**:
+| 文件 | 变更类型 |
+|------|------|
+| `src/config.py` | +8 行 (Hermes 配置段) |
+| `src/hermes.py` | 新增 (~160 行) |
+| `src/main.py` | +5 行 / -2 行 (导入 + 注入 + 调用点) |
+
+---
+
+## 第15轮 — Hermes 切换到文件队列模式 (对齐 Workshop 6) (2026-07-16)
+
+**用户 Prompt 摘要**:
+> 选择路径 A，改用 Workshop 6 文件队列模式。B 板未安装 Hermes Agent，希望和队友 A 板上已验证可行的方法保持一致。
+
+**Agent 采取的主要行动**:
+
+### 架构切换: HTTP 直连 → 文件队列 + Hermes cron
+
+**原方案 (第14轮)**: `requests.post()` HTTP 直连 Hermes 云端 API。
+**新方案 (对齐 Workshop 6)**:
+```
+PostureAnalyzer → hermes.try_push() → 写 alerts.jsonl
+                                            ↓
+Hermes Agent cron (每 1min) → deliver_alerts.sh → stdout → 微信
+```
+
+### 变更文件
+
+**Step 1 — `src/config.py`**: 精简配置
+- 移除: `HERMES_API_URL`, `HERMES_REQUEST_TIMEOUT_SEC`, `HERMES_RETRY_COUNT`
+- 新增: `HERMES_ALERT_FILE = "alerts.jsonl"`
+- 保留: `HERMES_ENABLED`, `HERMES_COOLDOWN_SEC`
+
+**Step 2 — `src/hermes.py`** 完全重写 (200→100 行):
+- 移除: 所有 `requests`/`threading`/HTTP 代码
+- 新增: `_write_alert()` 函数 — JSON-lines 文件追加 (复制 Workshop 6 `write_alert` 模式)
+- 冷却逻辑不变 (纯时间窗口 60s)
+- 零阻塞 — 文件写入 <1ms
+- 自测块: 3 项验证 (写入/冷却跳过/启用开关)
+
+**Step 3 — `bin/deliver_alerts.sh`** (新增, 60 行):
+- 100% 对齐 Workshop 6 同名脚本
+- 数据通过环境变量传递 (避免 shell 转义问题, 参考 Workshop 6 DEVLOG Issue #2)
+- 读 alerts.jsonl → 格式化微信消息 → stdout → 归档到 .delivered
+
+**Step 4 — `hermes-skills/posture-alert.md`** (新增):
+- 完整安装+配置教程 (Hermes Agent 安装 / cron 创建 / 端到端验证 / Troubleshooting)
+- 包含 Node.js 安装步骤 (ARM64, `/home/arduino` 分区)
+
+**Step 5 — `src/main.py`**: 无改动 (集成点不变, hermes.py 接口兼容)
+
+### 验证结果
+- hermes.py 自测: 写入 ✓ / 冷却跳过 ✓ / 禁用开关 ✓
+- deliver_alerts.sh: stdout 输出格式正确 ✓ / 归档到 .delivered ✓
+- 集成: PostureAnalyzer + HermesPusher 注入正常 ✓
+
+**Agent 回复摘要**:
+代码侧全部完成。还需用户侧操作: 安装 Hermes Agent (Node.js + hermes-agent 脚本) → `hermes gateway setup` 配微信 → 创建 cron 投递任务。代码不依赖 Hermes 是否安装 — 没有 Hermes 时告警事件仍正常写入 alerts.jsonl，安装后自动开始投递。
+
+**变更文件清单**:
+| 文件 | 变更类型 |
+|------|------|
+| `src/config.py` | 重写 Hermes 配置段 (-3/+1 参数) |
+| `src/hermes.py` | 重写 (200→100 行, HTTP→文件队列) |
+| `bin/deliver_alerts.sh` | 新增 (60 行) |
+| `hermes-skills/posture-alert.md` | 新增 (完整安装配置文档) |

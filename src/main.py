@@ -28,6 +28,7 @@ import asyncio
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from alerter import Alerter
 from landmarker import FaceLandmarker, LandmarkResult
+from hermes import HermesPusher
 import debug_viewer
 from config import (
     # 摄像头
@@ -677,8 +678,9 @@ class PostureAnalyzer:
     - ALERTING:    持续报警 → 坐姿恢复稳定 3 秒 → MONITORING
     """
 
-    def __init__(self, state: SharedState):
+    def __init__(self, state: SharedState, hermes: HermesPusher | None = None):
         self.state = state
+        self.hermes = hermes
         self.posture = PostureState.CALIBRATING
         self.state.posture_state = self.posture
         self.calibration_start = time.time()
@@ -810,6 +812,9 @@ class PostureAnalyzer:
                 self.state.posture_state = self.posture
                 self.state.set_alerting(True)
                 logger.warning(f"⚠ 触发报警！{reason} | 持续 {elapsed_bad:.1f}s")
+                # Hermes 云端推送（非阻塞，daemon 线程发送）
+                if self.hermes is not None:
+                    self.hermes.try_push(reason)
                 return True
         else:
             if self.state.bad_posture_start is not None:
@@ -1097,7 +1102,8 @@ def main():
         time.sleep(0.1)  # 错开启动，日志可读
 
     # ---- 主线程：状态机 + 报警 ----
-    analyzer = PostureAnalyzer(state)
+    hermes = HermesPusher()
+    analyzer = PostureAnalyzer(state, hermes=hermes)
     alerter = Alerter()
 
     logger.info("进入主循环（状态机 + 报警控制）")

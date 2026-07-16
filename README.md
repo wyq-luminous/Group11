@@ -18,6 +18,7 @@ SmartPosture_Guardian 是一款完全运行在 ARM64 边缘设备（Arduino UNO-
 - 🔵 四色 LED 状态反馈 (绿=正常 / 红=报警 / 蓝=校准中 / 绿慢闪=无人休眠)
 - 👥 多人脸智能选脸（最大脸优先 + 位置连续性防跳变）
 - 💤 无人自动休眠（20s 无脸降频省电，人脸恢复 3s 唤醒）
+- 📱 微信告警推送（异常坐姿 → Hermes Agent → 家长微信，1 分钟投递延迟）
 
 ---
 
@@ -73,7 +74,11 @@ SmartPosture_Guardian 是一款完全运行在 ARM64 边缘设备（Arduino UNO-
 │                                                      │
 │  线程2: 采集 (V4L2 30fps drain)                     │
 │  线程3: 推理 (YuNet 找脸 → PFLD 98点定位 → 姿态指标) │
-│  线程4: 主控 (PostureAnalyzer 状态机 + Alerter)     │
+│  线程4: 主控 (PostureAnalyzer 状态机 + Alerter + Hermes 推送) │
+│              │                                       │
+│              ├─── alerts.jsonl (文件队列)             │
+│              │    Hermes Agent cron 每分钟投递         │
+│              │    └── 家长微信收到告警                 │
 │              │                                       │
 │              ▼ msgpack RPC                           │
 │         /var/run/arduino-router.sock                 │
@@ -87,6 +92,36 @@ SmartPosture_Guardian 是一款完全运行在 ARM64 边缘设备（Arduino UNO-
 │  digitalWrite(D2) ── 蜂鸣器 (LOW 触发)              │
 └─────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 📱 微信告警推送 (Hermes Agent)
+
+坐姿异常触发报警时，系统自动通过 Hermes Agent 推送告警到家长微信。
+
+### 工作流程
+
+```
+异常坐姿 5s → 写 alerts.jsonl → Hermes cron (每分钟) → 投递脚本 → stdout → 微信
+```
+
+### 快速配置
+
+```bash
+# 1. 安装 Hermes Agent (一次性)
+hermes gateway setup          # 扫码登录微信
+hermes gateway install start  # 启动 gateway
+
+# 2. 创建投递 cron
+hermes cron create "every 1m" --no-agent --script deliver_alerts.sh --deliver weixin --name "坐姿告警"
+```
+
+详细配置见 `hermes-skills/posture-alert.md`。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `HERMES_ENABLED` | True | 总开关 |
+| `HERMES_COOLDOWN_SEC` | 60 | 冷却窗口 (调试用，正式建议 600) |
 
 ---
 
@@ -164,9 +199,14 @@ SmartPosture_Guardian/
 │   ├── main.py            # 主入口 (四线程调度 + FastAPI + FSM)
 │   ├── config.py          # 全局配置常量
 │   ├── alerter.py         # 报警输出 (LED矩阵 + RGB LED + 蜂鸣器)
+│   ├── hermes.py          # Hermes 微信告警推送 (文件队列模式)
 │   ├── landmarker.py      # PFLD 98点关键点定位 (双眼+鼻尖)
 │   ├── debug_viewer.py    # 调试上位机 (MJPEG流 + 16点眼轮廓标注)
 │   └── bench_pfld.py      # PFLD 模型 benchmark 工具
+├── bin/
+│   └── deliver_alerts.sh  # Hermes cron 投递脚本 (读 alerts.jsonl → stdout)
+├── hermes-skills/
+│   └── posture-alert.md   # Hermes Agent 安装与配置文档
 ├── models/
 │   ├── face_detection_yunet.onnx   # YuNet DNN 人脸检测 (228KB)
 │   └── pfpld.onnx                  # PFLD 98点面部关键点 (6.6MB)
@@ -231,7 +271,7 @@ python3 src/main.py
 - [x] **无感重校准**: 遮挡镜头 2 秒触发自动重校准，LED 蓝灯反馈 (2026-07-15)
 - [x] **Git 版本管理**: 接入 GitHub `wyq-luminous/Group11.git`，DevLog 自动记录 (2026-07-15)
 - [ ] **LED 阵列灰度动画**: 利用 8 级硬件灰度实现报警图案呼吸效果
-- [ ] **云端告警推送**: `requests` → Hermes 服务触发家长微信通知 (10min 冷却)
+- [x] **云端告警推送**: Hermes Agent 文件队列 + cron 投递 → 家长微信通知 (2026-07-16)
 - [x] **异常场景抗干扰**: 侧脸丢弃 + 帧间跳变冻结 + 歪头检测 (2026-07-15)
 - [x] **PFLD 面部关键点**: 98 点 WFLW 替代 YuNet 5 粗点，精确追踪双眼 (2026-07-15)
 - [x] **多人脸选脸**: 最大脸优先 + 位置连续性防跳变 (2026-07-15)
