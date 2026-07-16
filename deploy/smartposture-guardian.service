@@ -1,0 +1,23 @@
+[Unit]
+Description=SmartPosture Guardian - 慧姿·智能坐姿守护系统
+Documentation=https://github.com/wyq-luminous/Group11
+After=network-online.target hermes-gateway.service
+Wants=network-online.target hermes-gateway.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/arduino/SmartPosture_Guardian/src/main.py
+WorkingDirectory=/home/arduino/SmartPosture_Guardian
+Environment="PATH=/home/arduino/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="HOME=/home/arduino"
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

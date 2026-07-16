@@ -558,3 +558,68 @@ Hermes Agent cron (每 1min) → deliver_alerts.sh → stdout → 微信
 | `src/hermes.py` | 重写 (200→100 行, HTTP→文件队列) |
 | `bin/deliver_alerts.sh` | 新增 (60 行) |
 | `hermes-skills/posture-alert.md` | 新增 (完整安装配置文档) |
+
+---
+
+## 第16轮 — 生产级演示自动化改造：systemd 自启 + 运维手册 (2026-07-16)
+
+**用户 Prompt 摘要**:
+> 将项目从"开发原型"转变为"可独立运行的产品"，满足现场演示要求：插电即用，全程无需电脑。完成 systemd 开机自启、Hermes 网关保活、无头环境扫描、异常保活、优雅退出等五大检查项。先出体检报告，确认后实施改造。
+
+**Agent 采取的主要行动**:
+
+### Phase 1: 完备性体检
+
+深度扫描全部 `src/` 代码（main.py, config.py, alerter.py, hermes.py, landmarker.py, debug_viewer.py），输出五大领域体检报告：
+
+| 领域 | 评分 | 发现 |
+|------|------|------|
+| 自动启动 | 🔴 0/3 | 无 systemd 服务，纯手动 |
+| Hermes 自启 | 🟡 1/3 | Gateway 已安装但无自启服务 |
+| 无头兼容 | 🟢 5/5 | 无 `cv2.imshow`/`matplotlib` 等 GUI 调用；发现 `opencv-python` 和 `opencv-python-headless` 双包共存隐患 |
+| 崩溃保活 | 🟢 4/5 | 线程健康监控、摄像头重连、推理异常处理均到位；主循环缺少 broad except 兜底 |
+| 资源释放 | 🟢 3/3 | SIGTERM → Alerter.cleanup → 线程 join 完整 |
+
+额外发现：`msgpack` 未列入 `requirements.txt`（alerter.py 隐性依赖）。
+
+用户确认报告后进入 Phase 2。
+
+### Phase 2: 自动启动改造
+
+**发现 Hermes Gateway 已有 user systemd 服务**（`~/.config/systemd/user/hermes-gateway.service`，已启用，`linger=yes`），无需额外配置。
+
+**新建文件**:
+
+**Step 1 — `deploy/smartposture-guardian.service`** (systemd user service):
+- `Type=simple` → 前台运行，systemd 直接管理进程生命周期
+- `ExecStart=/usr/bin/python3 .../src/main.py` → 使用系统 python3（无 venv）
+- `After=network-online.target hermes-gateway.service` → 网络和 IM 就绪后启动
+- `Wants=hermes-gateway.service` → 确保 Hermes 一同启动
+- `Restart=always` + `RestartSec=5` → 崩溃后 5 秒自动重启
+- `KillSignal=SIGTERM` → 触发 main.py 的优雅退出逻辑
+- `TimeoutStopSec=15` → 等待清理完成
+- 安装至 `~/.config/systemd/user/`，`systemctl --user enable`
+
+**Step 2 — `docs/OPERATIONS_MANUAL.md`** (新增，完整运维手册):
+- 12 章 + 2 附录，覆盖：首次部署、启动/停止、LED 指示灯速查、Web 上位机、Hermes 微信绑定、坐姿判定逻辑、状态流转图、阈值修改指南、API 参考、异常排查（8 种场景）、日常维护命令、配置速查卡片
+
+### 验证结果
+
+| 测试项 | 结果 |
+|--------|------|
+| 正常启动 | ✅ 4 线程全部启动，API `{"status":"ok"}` |
+| 崩溃自愈 | ✅ `kill -9` → 5s 后 systemd 自动重启为新 PID |
+| 优雅退出 | ✅ `systemctl stop` → SIGTERM → Alerter 释放 → 线程退出 → exit 0 |
+| Hermes 自启 | ✅ 已存在，`enabled` + `linger=yes` |
+| 开机自启 | ✅ 两个服务均 `enabled`，`Linger=yes`，重启后自动拉起 |
+| 手动调试保留 | ✅ `systemctl --user stop` 后可手动 `python3 src/main.py` |
+
+**Agent 回复摘要**:
+自动启动改造完成。新增 1 个 systemd 服务文件 + 1 份完整运维手册。现在插电即可用：Linux 启动 → systemd 自动拉起 Hermes Gateway + SmartPosture Guardian → 5 秒校准 → 监控中。全程无需 SSH 或任何手动命令。手动调试能力完整保留。
+
+**变更文件清单**:
+| 文件 | 变更类型 |
+|------|------|
+| `deploy/smartposture-guardian.service` | 新增 (systemd user service) |
+| `docs/OPERATIONS_MANUAL.md` | 新增 (~400 行, 完整运维手册) |
+| `docs/DevLog.md` | 追加 (本条目) |
