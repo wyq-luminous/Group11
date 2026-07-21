@@ -8,7 +8,19 @@ FastAPI 接口边界条件测试
 """
 
 import pytest
-from fastapi.testclient import TestClient
+
+# starlette 的 TestClient 依赖 httpx；板上若未安装该包则整个模块跳过。
+# 这些端点的真实覆盖由 test_on_device.py::TestLiveAPI (打真实运行的服务) 承担，
+# 因此在板子上缺 httpx 不影响 API 被测到，只是换成对活服务测。
+try:
+    from fastapi.testclient import TestClient
+except (ImportError, RuntimeError) as _e:
+    pytest.skip(
+        f"fastapi TestClient 依赖缺失 ({_e.__class__.__name__}: httpx 未安装)，"
+        "跳过 API 单元测试；板上由 test_on_device.py::TestLiveAPI 覆盖。"
+        "如需在此机跑 TestClient 版: pip install --break-system-packages httpx",
+        allow_module_level=True,
+    )
 
 
 @pytest.fixture
