@@ -701,3 +701,16 @@ Hermes Agent cron (每 1min) → deliver_alerts.sh → stdout → 微信
 | `deploy/smartposture-guardian.service` | +2 行 (`ExecStartPre`) |
 | `src/alerter.py` | ~6 行 (RPC 错误日志) |
 | `docs/DevLog.md` | 追加 (本条目) |
+
+## 第18轮 — 全套测试用例编写 (边界条件为核心) (2026-07-20)
+
+**用户 Prompt 摘要**: 为项目编写专业、详细、覆盖全面的测试用例并说明测试方法，以边界条件测试为 feature；设备当前未连接但可连接。
+
+**Agent 采取的主要行动**:
+- 新建 `tests/` 共 11 个测试文件 + `conftest.py` + `pytest.ini`，177 个用例（163 个 PC 可跑，14 个 `-m device` 板上集成）
+- 核心手段: FakeClock 虚拟时钟精确控制所有时间边界 (5s 报警滤波 / 3s 解除 / 2s 遮挡 / 20s 休眠 / 3s 唤醒 / 60s Hermes 冷却)；FakeDetector/FakeNet mock 推理输出；HardwareRecorder mock Bridge RPC 与 sysfs
+- 每个数值阈值均在"恰好等于/刚好两侧"三点验证 `>` 与 `>=` 语义 (共 20 条边界矩阵，见 docs/TESTING.md)
+- 修复测试发现的真实 bug: `hermes.py` 写 alerts.jsonl 未指定 `encoding="utf-8"` (locale 依赖，Windows 下写出 GBK 乱码)
+- 编写 `docs/TESTING.md`: 四层测试策略 (逻辑单元/模型冒烟/板上集成/手动验收清单 17 项)、运行方法、边界矩阵、发现的 6 个问题清单
+
+**Agent 最终回复摘要**: PC 上 162 passed + 1 xfail (记录已知问题: ALERTING 进重校准时 is_alerting 未清)。另发现 README 歪头阈值 15° 与代码 12° 不一致、多人脸连续性裁决坐标系不匹配、WAITING_COOLDOWN 死状态等问题待用户决策。板上执行 `pytest -m device` 即可跑硬件集成层。

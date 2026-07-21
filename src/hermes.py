@@ -123,7 +123,7 @@ class HermesPusher:
         }
 
         try:
-            with open(self._alert_path, "a") as f:
+            with open(self._alert_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
             self._last_push_time = now
             logger.info("Hermes 告警已写入文件队列: %s", reason)
@@ -153,7 +153,7 @@ if __name__ == "__main__":
     time.sleep(0.1)
 
     if os.path.exists(hermes._alert_path):
-        with open(hermes._alert_path, "r") as f:
+        with open(hermes._alert_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
         print(f"alerts.jsonl 存在, {len(lines)} 行:")
         for line in lines:
