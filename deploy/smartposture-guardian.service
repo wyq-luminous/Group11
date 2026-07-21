@@ -8,7 +8,9 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 # 确保 MCU 固件先启动（LED 点阵 + 蜂鸣器依赖 STM32 Bridge RPC）
-ExecStartPre=/usr/bin/arduino-app-cli app start user:posture_alerter
+# 前缀 '-': 忽略非零退出码。app 已在运行时 `app start` 会返回
+# "App Is Running" 错误码 1，这属于期望状态，不应阻止服务启动。
+ExecStartPre=-/usr/bin/arduino-app-cli app start user:posture_alerter
 ExecStartPre=/bin/sleep 2
 ExecStart=/usr/bin/python3 /home/arduino/SmartPosture_Guardian/src/main.py
 WorkingDirectory=/home/arduino/SmartPosture_Guardian
